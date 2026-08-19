@@ -1864,6 +1864,12 @@ static void AddTip(HWND ctrl, const wchar_t* text) {
 // (voir MkCardStatic : la couleur est stockee dans GWLP_USERDATA de chacun).
 static LRESULT CALLBACK CardsHostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    // Un bouton envoie WM_COMMAND (BN_CLICKED) a son PARENT IMMEDIAT, qui est
+    // g_hCardsHost pour tous les boutons de carte - pas la fenetre principale.
+    // Sans ce relais, DefWindowProcW l'aurait simplement absorbe en silence :
+    // c'est ce qui rendait tous les boutons de carte muets.
+    case WM_COMMAND:
+        return SendMessageW(GetParent(hwnd), WM_COMMAND, wp, lp);
     case WM_SIZE:
         UpdateCardsScrollInfo();
         RepositionCards();
