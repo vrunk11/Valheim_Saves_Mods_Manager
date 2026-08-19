@@ -4,14 +4,25 @@ Petit gestionnaire **manuel** de mods Valheim, en C++ / Win32 natif.
 Pas de scan automatique, pas de téléchargement : tu gardes le contrôle,
 l'appli se contente de retenir tes liens et la date où tu les as vérifiés.
 
-- Un seul `.exe`, aucune dépendance, ~150 Ko.
-- Liste de mods : nom, catégorie, lien, dernière vérification, note.
-  - **Watch** : ouvre le lien
+- Un seul `.exe`, aucune dépendance, ~200 Ko (GDI+ et les boîtes de dialogue
+  de fichier sont livrées avec Windows).
+- Liste de mods : icône, nom, catégorie, lien, historique/changelog, DLL
+  associée, dernière vérification, note.
+  - **Watch** : ouvre le lien du mod
+  - **Historique** : ouvre la page des changements / versions (champ séparé)
   - **Check update** : ouvre le lien + horodate la vérification
-  - **Vérifié** : horodate sans ouvrir
+  - **Vérifié** : horodate SANS ouvrir de lien — utile si tu as déjà vérifié
+    ailleurs (Discord du mod, changelog déjà ouvert dans un autre onglet…)
+  - Clic droit sur un mod : menu avec toutes les actions, y compris localiser
+    le DLL installé dans l'explorateur
   - Rouge si non vérifié depuis 30+ jours, orange 14+, gris si jamais vérifié
-- Accès rapide aux dossiers `BepInEx/plugins`, `BepInEx/config`, dossier du jeu,
-  dossier des sauvegardes.
+  - La colonne DLL indique si le fichier associé est présent (vert),
+    manquant (rouge) ou non renseigné (gris), avec sa version quand elle est
+    lisible dans le fichier
+  - Icône par mod : PNG/JPG/BMP/ICO/GIF, choisie via un sélecteur de fichier
+    dans l'éditeur (aperçu affiché)
+- Accès rapide aux dossiers `BepInEx/plugins`, `BepInEx/config`, dossier du
+  jeu, dossier du DLL d'un mod donné.
 - Onglet Sauvegardes : liste des mondes et personnages (taille, date), backup
   en un clic vers `backups/`.
 - Détection auto du dossier Valheim (registre Steam + bibliothèques multiples),
@@ -68,19 +79,25 @@ release GitHub.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "valheimDir": "D:\\SteamLibrary\\steamapps\\common\\Valheim",
   "mods": [
     {
       "name": "ValheimPlus",
       "category": "QoL",
       "url": "https://thunderstore.io/...",
+      "changelogUrl": "https://thunderstore.io/.../changelog/",
+      "dllPath": "D:\\...\\BepInEx\\plugins\\ValheimPlus.dll",
+      "iconPath": "C:\\Users\\...\\Pictures\\valheimplus.png",
       "lastCheck": "2026-08-19 14:30",
       "note": "v0.9.9.16"
     }
   ]
 }
 ```
+
+Un fichier `valmods.json` v1 (sans `changelogUrl`/`dllPath`/`iconPath`) reste
+lisible tel quel : les champs manquants sont simplement traités comme vides.
 
 Fichier texte, éditable à la main. `valmods.json` n'est volontairement pas
 versionné (voir `.gitignore`) : c'est ta liste personnelle, pas un fichier

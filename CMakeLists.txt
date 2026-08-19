@@ -16,7 +16,12 @@ add_executable(valmods WIN32
 )
 
 target_compile_definitions(valmods PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0600)
-target_link_libraries(valmods PRIVATE comctl32 shell32 ole32 advapi32 gdi32 user32)
+target_link_libraries(valmods PRIVATE
+    comctl32 shell32 ole32 advapi32 gdi32 user32
+    gdiplus    # decode les icones de mod (PNG/JPG/BMP/ICO/GIF)
+    version    # lit la version des DLL de mods installes
+    comdlg32   # boites "Parcourir..." (choisir un DLL / une icone)
+)
 
 if(MINGW)
     # -municode : point d'entree wWinMain    -static : exe autonome, aucune DLL a livrer

@@ -1,14 +1,18 @@
 // ============================================================================
 //  ValMods - petit gestionnaire manuel de mods Valheim (Win32 natif, C++)
-//  - liste de mods (nom / categorie / lien / derniere verification / note)
-//  - bouton "Watch"        : ouvre le lien
+//  - liste de mods (icone / nom / categorie / lien / historique / DLL lie /
+//    derniere verification / note)
+//  - bouton "Watch"        : ouvre le lien du mod
+//  - bouton "Historique"   : ouvre la page des changements / versions
 //  - bouton "Check update" : ouvre le lien ET horodate la verification
-//  - bouton "Verifie"      : horodate sans ouvrir
+//  - bouton "Verifie"      : horodate SANS ouvrir (deja verifie ailleurs)
+//  - clic droit sur un mod : menu avec toutes les actions + DLL
 //  - acces rapide aux dossiers plugins / config / sauvegardes
 //  - onglet Sauvegardes : liste des mondes et des personnages + backup
 //
-//  Aucune dependance externe. Donnees stockees a cote de l'exe :
-//      valmods.tsv  (les mods)      valmods.ini  (le chemin du jeu)
+//  Aucune dependance externe : GDI+ (icones) et Common Dialogs (parcourir)
+//  sont livres avec Windows. Donnees stockees a cote de l'exe :
+//      valmods.json
 // ============================================================================
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -19,14 +23,21 @@
 #define _UNICODE
 #endif
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX            // gdiplus.h utilise std::min/max ; les macros
+                             // min/max de windows.h les masqueraient sinon.
 #define _WIN32_WINNT 0x0600
 
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>         // GetOpenFileNameW (parcourir un DLL / une icone)
 #include <shlobj.h>
 #include <shellapi.h>
+#include <winver.h>          // GetFileVersionInfoW / VerQueryValueW (version DLL)
+#include <objidl.h>
+#include <gdiplus.h>          // decode PNG/JPG/BMP/ICO/GIF pour les icones de mod
 #include <string>
 #include <vector>
+#include <map>
 #include <algorithm>
 #include <sstream>
 #include <ctime>
@@ -40,6 +51,9 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "version.lib")
+#pragma comment(lib, "comdlg32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' \
 name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
 processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -55,6 +69,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_BCHECK     1006
 #define IDC_BMARK      1007
 #define IDC_BCOPY      1008
+#define IDC_BHIST      1009
 #define IDC_WORLDS     1010
 #define IDC_CHARS      1011
 #define IDC_LBL1       1012
@@ -72,18 +87,40 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDM_GAMEDIR    2006
 #define IDM_SETDIR     2007
 #define IDM_ABOUT      2008
-
-#define VALMODS_VERSION "1.1.0"
 #define IDM_BEPINEX    2009
+
+// menu contextuel (clic droit) sur une ligne de la liste des mods
+#define IDM_CTX_WATCH       2100
+#define IDM_CTX_HIST        2101
+#define IDM_CTX_CHECK       2102
+#define IDM_CTX_MARK        2103
+#define IDM_CTX_LOCATE_DLL  2104
+#define IDM_CTX_OPEN_DLLDIR 2105
+#define IDM_CTX_COPY        2106
+#define IDM_CTX_EDIT        2107
+#define IDM_CTX_DELETE      2108
+
+// boutons propres a la fenetre d'edition d'un mod
+#define IDC_E_BROWSEDLL   3001
+#define IDC_E_BROWSEICON  3002
+#define IDC_E_CLEARICON   3003
+
+#define VALMODS_VERSION "1.2.0"
+
+// indices des colonnes de la liste des mods (utilises pour le tri et le
+// dessin personnalise de la colonne DLL)
+enum { COL_NAME = 0, COL_CAT = 1, COL_LASTCHECK = 2, COL_AGE = 3,
+       COL_DLL = 4, COL_URL = 5, COL_NOTE = 6 };
 
 // ---------------------------------------------------------------- donnees
 struct Mod {
-    std::wstring name, cat, url, last, note;
+    std::wstring name, cat, url, changelogUrl, dllPath, iconPath, last, note;
 };
 
 static HINSTANCE g_hInst = NULL;
 static HWND  g_hMain = NULL, g_hTab = NULL, g_hMods = NULL;
 static HWND  g_hWorlds = NULL, g_hChars = NULL;
+static HWND  g_hTooltip = NULL;
 static HFONT g_font = NULL;
 static std::vector<Mod> g_mods;
 static std::wstring g_valheimDir;
@@ -91,8 +128,16 @@ static int  g_sortCol = 0;
 static bool g_sortAsc = true;
 static bool g_lastListIsWorld = true;   // pour le bouton backup
 
-static HWND g_pageMods[8];  static int g_nMods = 0;
-static HWND g_pageSaves[8]; static int g_nSaves = 0;
+static ULONG_PTR g_gdiplusToken = 0;
+static HIMAGELIST g_imgList = NULL;
+static int g_defaultIconIdx = -1;
+static std::map<std::wstring, int> g_iconCache;   // chemin icone -> index image list
+
+// 8 boutons + la liste sur l'onglet Mods : la taille doit rester >= au
+// nombre d'elements pousses dans WM_CREATE, sous peine d'ecrire hors
+// tableau (c'etait juste-juste a 8 avant l'ajout du bouton Historique).
+static HWND g_pageMods[16];  static int g_nMods = 0;
+static HWND g_pageSaves[8];  static int g_nSaves = 0;
 
 // ---------------------------------------------------------------- utilitaires
 static std::string W2U(const std::wstring& w) {
@@ -196,6 +241,67 @@ static std::wstring ClipboardText() {
     }
     CloseClipboard();
     return Clean(r);
+}
+
+// ---------------------------------------------------------------- icones (GDI+)
+// Chaque mod peut avoir un petit logo, charge depuis un fichier local
+// (PNG/JPG/BMP/ICO/GIF) via GDI+. GDI+ est livre avec Windows depuis XP :
+// aucune dependance ajoutee, et il decode bien plus de formats que LoadImage
+// (qui ne sait lire nativement que BMP/ICO/CUR).
+static HICON MakeDefaultIcon(int size) {
+    Gdiplus::Bitmap bmp((INT)size, (INT)size, PixelFormat32bppARGB);
+    Gdiplus::Graphics g(&bmp);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.Clear(Gdiplus::Color(0, 0, 0, 0));
+    Gdiplus::SolidBrush fill(Gdiplus::Color(255, 100, 100, 112));
+    Gdiplus::Pen pen(Gdiplus::Color(255, 60, 60, 70), 1.0f);
+    float pad = 1.0f, s = (float)size;
+    g.FillRectangle(&fill, pad, pad, s - 2 * pad, s - 2 * pad);
+    g.DrawRectangle(&pen, pad, pad, s - 2 * pad, s - 2 * pad);
+    HICON h = NULL;
+    if (bmp.GetHICON(&h) != Gdiplus::Ok) return NULL;
+    return h;   // NULL si GDI+ n'a pas pu s'initialiser : les appelants le gerent
+}
+static HICON LoadScaledIconFromFile(const std::wstring& path, int size) {
+    if (path.empty() || !FileExists(path)) return NULL;
+    Gdiplus::Bitmap* src = Gdiplus::Bitmap::FromFile(path.c_str(), FALSE);
+    if (!src) return NULL;
+    if (src->GetLastStatus() != Gdiplus::Ok || src->GetWidth() == 0 || src->GetHeight() == 0) {
+        delete src;
+        return NULL;
+    }
+    Gdiplus::Bitmap dest((INT)size, (INT)size, PixelFormat32bppARGB);
+    Gdiplus::Graphics g(&dest);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.Clear(Gdiplus::Color(0, 0, 0, 0));
+    float sw = (float)src->GetWidth(), sh = (float)src->GetHeight();
+    float scale = (sw > sh) ? (float)size / sw : (float)size / sh;   // conserve le ratio
+    float dw = sw * scale, dh = sh * scale;
+    float dx = ((float)size - dw) / 2.0f, dy = ((float)size - dh) / 2.0f;
+    g.DrawImage(src, dx, dy, dw, dh);
+    delete src;
+    HICON h = NULL;
+    if (dest.GetHICON(&h) != Gdiplus::Ok) return NULL;
+    return h;
+}
+// Index dans l'image list (16x16) pour ce chemin d'icone, charge et mis en
+// cache au premier appel ; un chemin vide ou illisible retombe sur l'icone
+// par defaut. Le cache n'est PAS invalide si le fichier change sur disque a
+// chemin egal - re-parcourir le fichier dans l'editeur force un rechargement.
+static int GetOrLoadIcon(const std::wstring& path) {
+    if (path.empty() || !g_imgList) return g_defaultIconIdx;
+    std::map<std::wstring, int>::iterator it = g_iconCache.find(path);
+    if (it != g_iconCache.end()) return it->second;
+    HICON hi = LoadScaledIconFromFile(path, 16);
+    int idx = g_defaultIconIdx;
+    if (hi) {
+        int added = ImageList_AddIcon(g_imgList, hi);
+        DestroyIcon(hi);
+        if (added >= 0) idx = added;
+    }
+    g_iconCache[path] = idx;
+    return idx;
 }
 
 // --- lecture / ecriture de fichiers via l'API Win32 (chemins Unicode surs) ---
@@ -352,10 +458,11 @@ static std::wstring DetectValheim() {
 //
 //   valmods.json
 //   {
-//     "version": 1,
+//     "version": 2,
 //     "valheimDir": "D:\\SteamLibrary\\steamapps\\common\\Valheim",
 //     "mods": [
 //       { "name": "...", "category": "...", "url": "...",
+//         "changelogUrl": "...", "dllPath": "...", "iconPath": "...",
 //         "lastCheck": "2026-08-19 14:30", "note": "..." }
 //     ]
 //   }
@@ -365,17 +472,20 @@ static std::wstring LegacyFile() { return ExeDir() + L"\\valmods.tsv"; }
 static void SaveMods() {
     std::string out;
     out += "{\n";
-    out += "  \"version\": 1,\n";
+    out += "  \"version\": 2,\n";
     out += "  \"valheimDir\": " + mj::quote(W2U(g_valheimDir)) + ",\n";
     out += "  \"mods\": [\n";
     for (size_t i = 0; i < g_mods.size(); ++i) {
         const Mod& m = g_mods[i];
         out += "    {\n";
-        out += "      \"name\":      " + mj::quote(W2U(m.name)) + ",\n";
-        out += "      \"category\":  " + mj::quote(W2U(m.cat))  + ",\n";
-        out += "      \"url\":       " + mj::quote(W2U(m.url))  + ",\n";
-        out += "      \"lastCheck\": " + mj::quote(W2U(m.last)) + ",\n";
-        out += "      \"note\":      " + mj::quote(W2U(m.note)) + "\n";
+        out += "      \"name\":         " + mj::quote(W2U(m.name))         + ",\n";
+        out += "      \"category\":     " + mj::quote(W2U(m.cat))          + ",\n";
+        out += "      \"url\":          " + mj::quote(W2U(m.url))          + ",\n";
+        out += "      \"changelogUrl\": " + mj::quote(W2U(m.changelogUrl)) + ",\n";
+        out += "      \"dllPath\":      " + mj::quote(W2U(m.dllPath))      + ",\n";
+        out += "      \"iconPath\":     " + mj::quote(W2U(m.iconPath))     + ",\n";
+        out += "      \"lastCheck\":    " + mj::quote(W2U(m.last))         + ",\n";
+        out += "      \"note\":         " + mj::quote(W2U(m.note))         + "\n";
         out += (i + 1 < g_mods.size()) ? "    },\n" : "    }\n";
     }
     out += "  ]\n";
@@ -428,11 +538,14 @@ static void LoadData() {
                     const mj::Value& v = mods->arr[i];
                     if (v.type != mj::OBJ) continue;
                     Mod m;
-                    m.name = Clean(U2W(v.s("name")));
-                    m.cat  = Clean(U2W(v.s("category")));
-                    m.url  = Clean(U2W(v.s("url")));
-                    m.last = Clean(U2W(v.s("lastCheck")));
-                    m.note = Clean(U2W(v.s("note")));
+                    m.name         = Clean(U2W(v.s("name")));
+                    m.cat          = Clean(U2W(v.s("category")));
+                    m.url          = Clean(U2W(v.s("url")));
+                    m.changelogUrl = Clean(U2W(v.s("changelogUrl")));
+                    m.dllPath      = Clean(U2W(v.s("dllPath")));
+                    m.iconPath     = Clean(U2W(v.s("iconPath")));
+                    m.last         = Clean(U2W(v.s("lastCheck")));
+                    m.note         = Clean(U2W(v.s("note")));
                     if (!m.name.empty() || !m.url.empty()) g_mods.push_back(m);
                 }
             }
@@ -459,10 +572,10 @@ static void LoadData() {
 static bool ModLess(const Mod& a, const Mod& b) {
     int r = 0;
     switch (g_sortCol) {
-        case 0: r = lstrcmpiW(a.name.c_str(), b.name.c_str()); break;
-        case 1: r = lstrcmpiW(a.cat.c_str(), b.cat.c_str()); break;
-        case 2:
-        case 3: {
+        case COL_NAME: r = lstrcmpiW(a.name.c_str(), b.name.c_str()); break;
+        case COL_CAT:  r = lstrcmpiW(a.cat.c_str(), b.cat.c_str()); break;
+        case COL_LASTCHECK:
+        case COL_AGE: {
             int da = DaysSince(a.last), db = DaysSince(b.last);
             if (da < 0) da = 100000;            // jamais verifie = tout en haut
             if (db < 0) db = 100000;
@@ -470,10 +583,44 @@ static bool ModLess(const Mod& a, const Mod& b) {
             if (r == 0) r = lstrcmpiW(a.name.c_str(), b.name.c_str());
             break;
         }
-        case 4: r = lstrcmpiW(a.url.c_str(), b.url.c_str()); break;
-        default: r = lstrcmpiW(a.note.c_str(), b.note.c_str()); break;
+        case COL_DLL: r = lstrcmpiW(a.dllPath.c_str(), b.dllPath.c_str()); break;
+        case COL_URL: r = lstrcmpiW(a.url.c_str(), b.url.c_str()); break;
+        default:      r = lstrcmpiW(a.note.c_str(), b.note.c_str()); break;
     }
     return g_sortAsc ? (r < 0) : (r > 0);
+}
+
+// ---------------------------------------------------------------- DLL lie
+static std::wstring DllFileName(const std::wstring& path) {
+    size_t p = path.find_last_of(L"\\/");
+    return (p == std::wstring::npos) ? path : path.substr(p + 1);
+}
+static std::wstring GetDllVersionString(const std::wstring& path) {
+    DWORD handle = 0;
+    DWORD sz = GetFileVersionInfoSizeW(path.c_str(), &handle);
+    if (!sz) return L"";
+    std::vector<BYTE> buf(sz);
+    if (!GetFileVersionInfoW(path.c_str(), 0, sz, &buf[0])) return L"";
+    VS_FIXEDFILEINFO* ffi = NULL;
+    UINT len = 0;
+    if (!VerQueryValueW(&buf[0], L"\\", (LPVOID*)&ffi, &len) || !ffi || len == 0) return L"";
+    wchar_t out[64];
+    wsprintfW(out, L"%u.%u.%u.%u",
+        HIWORD(ffi->dwFileVersionMS), LOWORD(ffi->dwFileVersionMS),
+        HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS));
+    return out;
+}
+// missingOut, si fourni, est mis a true si un DLL est renseigne mais introuvable
+static std::wstring DllStatusText(const Mod& m, bool* missingOut) {
+    if (missingOut) *missingOut = false;
+    if (m.dllPath.empty()) return L"-";
+    std::wstring fn = DllFileName(m.dllPath);
+    if (!FileExists(m.dllPath)) {
+        if (missingOut) *missingOut = true;
+        return L"manquant : " + fn;
+    }
+    std::wstring ver = GetDllVersionString(m.dllPath);
+    return ver.empty() ? fn : (fn + L" (v" + ver + L")");
 }
 
 // ---------------------------------------------------------------- liste mods
@@ -483,18 +630,21 @@ static void RefillMods() {
     ListView_DeleteAllItems(g_hMods);
     for (size_t i = 0; i < g_mods.size(); ++i) {
         LVITEMW it; memset(&it, 0, sizeof(it));
-        it.mask = LVIF_TEXT | LVIF_PARAM;
+        it.mask = LVIF_TEXT | LVIF_PARAM | LVIF_IMAGE;
         it.iItem = (int)i;
+        it.iImage = GetOrLoadIcon(g_mods[i].iconPath);
         it.pszText = (LPWSTR)g_mods[i].name.c_str();
         it.lParam = (LPARAM)i;
         ListView_InsertItem(g_hMods, &it);
-        ListView_SetItemText(g_hMods, (int)i, 1, (LPWSTR)g_mods[i].cat.c_str());
+        ListView_SetItemText(g_hMods, (int)i, COL_CAT, (LPWSTR)g_mods[i].cat.c_str());
         std::wstring last = g_mods[i].last.empty() ? L"jamais" : g_mods[i].last;
-        ListView_SetItemText(g_hMods, (int)i, 2, (LPWSTR)last.c_str());
+        ListView_SetItemText(g_hMods, (int)i, COL_LASTCHECK, (LPWSTR)last.c_str());
         std::wstring dt = DaysText(g_mods[i].last);
-        ListView_SetItemText(g_hMods, (int)i, 3, (LPWSTR)dt.c_str());
-        ListView_SetItemText(g_hMods, (int)i, 4, (LPWSTR)g_mods[i].url.c_str());
-        ListView_SetItemText(g_hMods, (int)i, 5, (LPWSTR)g_mods[i].note.c_str());
+        ListView_SetItemText(g_hMods, (int)i, COL_AGE, (LPWSTR)dt.c_str());
+        std::wstring dllTxt = DllStatusText(g_mods[i], NULL);
+        ListView_SetItemText(g_hMods, (int)i, COL_DLL, (LPWSTR)dllTxt.c_str());
+        ListView_SetItemText(g_hMods, (int)i, COL_URL, (LPWSTR)g_mods[i].url.c_str());
+        ListView_SetItemText(g_hMods, (int)i, COL_NOTE, (LPWSTR)g_mods[i].note.c_str());
     }
     SendMessageW(g_hMods, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_hMods, NULL, TRUE);
@@ -510,8 +660,10 @@ static void SelectMod(int i) {
 struct EditCtx {
     Mod m;
     bool ok;
-    HWND hName, hCat, hUrl, hNote;
-    EditCtx() : ok(false), hName(0), hCat(0), hUrl(0), hNote(0) {}
+    HWND hName, hCat, hUrl, hHist, hDll, hIcon, hNote, hIconPreview;
+    HICON previewIcon;
+    EditCtx() : ok(false), hName(0), hCat(0), hUrl(0), hHist(0), hDll(0), hIcon(0),
+                hNote(0), hIconPreview(0), previewIcon(0) {}
 };
 
 static HWND MkLabel(HWND p, const wchar_t* t, int x, int y, int w) {
@@ -527,6 +679,52 @@ static HWND MkEdit(HWND p, const std::wstring& txt, int x, int y, int w) {
     SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
     return h;
 }
+static HWND MkDlgButton(HWND p, int id, const wchar_t* txt, int x, int y, int w, int h) {
+    HWND btn = CreateWindowExW(0, L"BUTTON", txt,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        x, y, w, h, p, (HMENU)(INT_PTR)id, g_hInst, NULL);
+    SendMessageW(btn, WM_SETFONT, (WPARAM)g_font, TRUE);
+    return btn;
+}
+
+// Boite "Parcourir..." standard ; renvoie 'current' inchange si l'utilisateur
+// annule, pour que l'appelant n'ait pas a distinguer "annule" de "vide".
+static std::wstring BrowseFile(HWND owner, const wchar_t* filter,
+                               const std::wstring& current, const wchar_t* title)
+{
+    wchar_t buf[MAX_PATH]; buf[0] = 0;
+    if (!current.empty()) {
+        wcsncpy(buf, current.c_str(), MAX_PATH - 1);
+        buf[MAX_PATH - 1] = 0;
+    }
+    std::wstring initDir;
+    if (!current.empty()) {
+        size_t p = current.find_last_of(L"\\/");
+        if (p != std::wstring::npos) initDir = current.substr(0, p);
+    }
+    if (initDir.empty() || !DirExists(initDir)) {
+        std::wstring pd = PluginsDir();
+        initDir = DirExists(pd) ? pd : L"";
+    }
+    OPENFILENAMEW ofn; memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = buf;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = title;
+    ofn.lpstrInitialDir = initDir.empty() ? NULL : initDir.c_str();
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (GetOpenFileNameW(&ofn)) return std::wstring(buf);
+    return current;
+}
+static void UpdateIconPreview(EditCtx* c, const std::wstring& path) {
+    if (!c || !c->hIconPreview) return;
+    HICON hi = path.empty() ? NULL : LoadScaledIconFromFile(path, 32);
+    SendMessageW(c->hIconPreview, STM_SETICON, (WPARAM)hi, 0);
+    if (c->previewIcon) DestroyIcon(c->previewIcon);
+    c->previewIcon = hi;
+}
 
 static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     EditCtx* c = (EditCtx*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -535,38 +733,85 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CREATESTRUCTW* cs = (CREATESTRUCTW*)lp;
         c = (EditCtx*)cs->lpCreateParams;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)c);
-        const int X = 12, W = 446;
-        MkLabel(hwnd, L"Nom du mod *", X, 10, W);
-        c->hName = MkEdit(hwnd, c->m.name, X, 28, W);
-        MkLabel(hwnd, L"Categorie / auteur", X, 58, W);
-        c->hCat = MkEdit(hwnd, c->m.cat, X, 76, W);
-        MkLabel(hwnd, L"Lien (Thunderstore, Nexus, GitHub...) *", X, 106, W);
-        c->hUrl = MkEdit(hwnd, c->m.url, X, 124, W);
-        MkLabel(hwnd, L"Note (version installee, remarques...)", X, 154, W);
-        c->hNote = MkEdit(hwnd, c->m.note, X, 172, W);
+
+        // -- colonne de gauche : champs texte (nom / categorie / liens) -----
+        const int LX = 12, LW = 360;
+        MkLabel(hwnd, L"Nom du mod *", LX, 10, LW);
+        c->hName = MkEdit(hwnd, c->m.name, LX, 28, LW);
+        MkLabel(hwnd, L"Categorie / auteur", LX, 58, LW);
+        c->hCat = MkEdit(hwnd, c->m.cat, LX, 76, LW);
+        MkLabel(hwnd, L"Lien de la page du mod *", LX, 106, LW);
+        c->hUrl = MkEdit(hwnd, c->m.url, LX, 124, LW);
+        MkLabel(hwnd, L"Lien historique / changelog (optionnel)", LX, 154, LW);
+        c->hHist = MkEdit(hwnd, c->m.changelogUrl, LX, 172, LW);
+
+        // -- colonne de droite : icone (apercu + parcourir + effacer) -------
+        const int IX = LX + LW + 16;   // 388
+        MkLabel(hwnd, L"Icone", IX, 10, 130);
+        c->hIconPreview = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_ICON | SS_CENTERIMAGE,
+            IX, 28, 40, 40, hwnd, NULL, g_hInst, NULL);
+        MkDlgButton(hwnd, IDC_E_BROWSEICON, L"Parcourir...", IX, 72, 130, 24);
+        MkDlgButton(hwnd, IDC_E_CLEARICON,  L"Effacer",      IX, 100, 130, 24);
+
+        // -- DLL associe, pleine largeur -------------------------------------
+        MkLabel(hwnd, L"DLL installe (pour verifier qu'il est bien present)", LX, 202, LW + 16 + 130);
+        c->hDll = MkEdit(hwnd, c->m.dllPath, LX, 220, LW);
+        MkDlgButton(hwnd, IDC_E_BROWSEDLL, L"Parcourir...", LX + LW + 24, 220, 124, 24);
+
+        MkLabel(hwnd, L"Note (version installee, remarques...)", LX, 250, LW + 16 + 130);
+        c->hNote = MkEdit(hwnd, c->m.note, LX, 268, LW + 16 + 130);
+
         HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            268, 210, 92, 28, hwnd, (HMENU)IDOK, g_hInst, NULL);
+            336, 306, 92, 28, hwnd, (HMENU)IDOK, g_hInst, NULL);
         HWND ca = CreateWindowExW(0, L"BUTTON", L"Annuler",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            366, 210, 92, 28, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
+            436, 306, 92, 28, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
         SendMessageW(ok, WM_SETFONT, (WPARAM)g_font, TRUE);
         SendMessageW(ca, WM_SETFONT, (WPARAM)g_font, TRUE);
+
+        if (!c->m.iconPath.empty()) UpdateIconPreview(c, c->m.iconPath);
+
         SetFocus(c->hName);
         return 0;
     }
     case WM_COMMAND:
+        if (LOWORD(wp) == IDC_E_BROWSEDLL && c) {
+            std::wstring picked = BrowseFile(hwnd,
+                L"Bibliotheques (*.dll)\0*.dll\0Tous les fichiers (*.*)\0*.*\0",
+                GetTextOf(c->hDll), L"Choisir le DLL installe");
+            SetWindowTextW(c->hDll, picked.c_str());
+            return 0;
+        }
+        if (LOWORD(wp) == IDC_E_BROWSEICON && c) {
+            std::wstring picked = BrowseFile(hwnd,
+                L"Images (*.png;*.jpg;*.jpeg;*.bmp;*.ico;*.gif)\0*.png;*.jpg;*.jpeg;*.bmp;*.ico;*.gif\0"
+                L"Tous les fichiers (*.*)\0*.*\0",
+                GetTextOf(c->hIcon), L"Choisir une icone");
+            SetWindowTextW(c->hIcon, picked.c_str());
+            UpdateIconPreview(c, picked);
+            return 0;
+        }
+        if (LOWORD(wp) == IDC_E_CLEARICON && c) {
+            SetWindowTextW(c->hIcon, L"");
+            UpdateIconPreview(c, L"");
+            return 0;
+        }
         if (LOWORD(wp) == IDOK && c) {
             std::wstring n = Clean(GetTextOf(c->hName));
             std::wstring u = Clean(GetTextOf(c->hUrl));
             if (n.empty() || u.empty()) {
-                MessageBoxW(hwnd, L"Le nom et le lien sont obligatoires.",
+                MessageBoxW(hwnd, L"Le nom et le lien de la page du mod sont obligatoires.",
                     L"ValMods", MB_OK | MB_ICONWARNING);
                 return 0;
             }
             c->m.name = n;
             c->m.cat  = Clean(GetTextOf(c->hCat));
             c->m.url  = u;
+            c->m.changelogUrl = Clean(GetTextOf(c->hHist));
+            c->m.dllPath      = Clean(GetTextOf(c->hDll));
+            c->m.iconPath     = Clean(GetTextOf(c->hIcon));
             c->m.note = Clean(GetTextOf(c->hNote));
             c->ok = true;
             DestroyWindow(hwnd);
@@ -574,6 +819,11 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (LOWORD(wp) == IDCANCEL) { DestroyWindow(hwnd); return 0; }
         break;
+    case WM_DESTROY:
+        // l'apercu d'icone est une copie GDI+ locale a cette fenetre, jamais
+        // partagee avec l'image list de la liste principale : a nettoyer ici.
+        if (c && c->previewIcon) { DestroyIcon(c->previewIcon); c->previewIcon = NULL; }
+        return 0;
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
@@ -595,7 +845,7 @@ static bool ShowModEditor(HWND parent, const wchar_t* title, Mod& io) {
         reg = true;
     }
     EditCtx ctx; ctx.m = io;
-    RECT r = { 0, 0, 470, 250 };
+    RECT r = { 0, 0, 540, 350 };
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     AdjustWindowRect(&r, style, FALSE);
     RECT pr; GetWindowRect(parent, &pr);
@@ -780,6 +1030,43 @@ static void ActionCopy(HWND hwnd) {
     if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
     CopyToClipboard(hwnd, g_mods[i].url);
 }
+static void ActionOpenHistory(HWND hwnd) {
+    int i = SelectedMod();
+    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
+    if (g_mods[i].changelogUrl.empty()) {
+        Info(hwnd, L"Ce mod n'a pas de lien vers son historique des versions.\n"
+                   L"Ajoute-le en modifiant le mod (bouton Modifier).");
+        return;
+    }
+    ShellExecuteW(NULL, L"open", g_mods[i].changelogUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+}
+static void ActionLocateDll(HWND hwnd) {
+    int i = SelectedMod();
+    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
+    const std::wstring& p = g_mods[i].dllPath;
+    if (p.empty()) {
+        Info(hwnd, L"Aucun DLL associe a ce mod.\nAssocie-le en modifiant le mod (bouton Modifier).");
+        return;
+    }
+    if (!FileExists(p)) {
+        std::wstring m = L"Le fichier DLL associe est introuvable :\n" + p;
+        MessageBoxW(hwnd, m.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    RevealFile(p);
+}
+static void ActionOpenDllDir(HWND hwnd) {
+    int i = SelectedMod();
+    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
+    const std::wstring& p = g_mods[i].dllPath;
+    if (p.empty()) {
+        Info(hwnd, L"Aucun DLL associe a ce mod.\nAssocie-le en modifiant le mod (bouton Modifier).");
+        return;
+    }
+    size_t s = p.find_last_of(L"\\/");
+    std::wstring dir = (s == std::wstring::npos) ? PluginsDir() : p.substr(0, s);
+    OpenFolder(hwnd, dir, L"dossier du DLL");
+}
 
 // ---------------------------------------------------------------- parametres
 static int CALLBACK BrowseCB(HWND hwnd, UINT msg, LPARAM lp, LPARAM data) {
@@ -826,14 +1113,17 @@ static void LayoutAll(HWND hwnd) {
     if (pw < 100) pw = 100;
     if (ph < 100) ph = 100;
 
-    // --- onglet mods : rangee de boutons + liste
+    // --- onglet mods : deux rangees de boutons + liste
     const int bw = 104, bh = 28, gap = 6;
-    int ids[7] = { IDC_BADD, IDC_BEDIT, IDC_BDEL, IDC_BWATCH, IDC_BCHECK, IDC_BMARK, IDC_BCOPY };
-    for (int i = 0; i < 7; ++i) {
-        HWND b = GetDlgItem(hwnd, ids[i]);
-        if (b) MoveWindow(b, px + i * (bw + gap), py, bw, bh, TRUE);
+    int row1[4] = { IDC_BADD, IDC_BEDIT, IDC_BDEL, IDC_BCOPY };
+    int row2[4] = { IDC_BWATCH, IDC_BHIST, IDC_BCHECK, IDC_BMARK };
+    for (int i = 0; i < 4; ++i) {
+        HWND b1 = GetDlgItem(hwnd, row1[i]);
+        if (b1) MoveWindow(b1, px + i * (bw + gap), py, bw, bh, TRUE);
+        HWND b2 = GetDlgItem(hwnd, row2[i]);
+        if (b2) MoveWindow(b2, px + i * (bw + gap), py + bh + gap, bw, bh, TRUE);
     }
-    MoveWindow(g_hMods, px, py + bh + 8, pw, ph - bh - 8, TRUE);
+    MoveWindow(g_hMods, px, py + 2 * (bh + gap), pw, ph - 2 * (bh + gap), TRUE);
 
     // --- onglet sauvegardes
     int lh = (ph - 84) / 2;
@@ -874,11 +1164,21 @@ static void AddCol(HWND list, int i, const wchar_t* txt, int w) {
     c.cx = w;
     ListView_InsertColumn(list, i, &c);
 }
+static void AddTip(HWND ctrl, const wchar_t* text) {
+    if (!g_hTooltip || !ctrl) return;
+    TOOLINFOW ti; memset(&ti, 0, sizeof(ti));
+    ti.cbSize = sizeof(ti);
+    ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd = GetParent(ctrl);
+    ti.uId = (UINT_PTR)ctrl;
+    ti.lpszText = (LPWSTR)text;
+    SendMessageW(g_hTooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+}
 
 static void BuildMenu(HWND hwnd) {
     HMENU bar = CreateMenu();
     HMENU f = CreatePopupMenu();
-    AppendMenuW(f, MF_STRING, IDM_OPENDATA, L"Ouvrir le dossier de donnees\tvalmods.tsv");
+    AppendMenuW(f, MF_STRING, IDM_OPENDATA, L"Ouvrir le dossier de donnees\tvalmods.json");
     AppendMenuW(f, MF_SEPARATOR, 0, NULL);
     AppendMenuW(f, MF_STRING, IDM_EXIT, L"Quitter");
     HMENU d = CreatePopupMenu();
@@ -931,18 +1231,52 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BADD,   L"Ajouter");
         g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BEDIT,  L"Modifier");
         g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BDEL,   L"Supprimer");
+        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BCOPY,  L"Copier lien");
         g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BWATCH, L"Watch");
+        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BHIST,  L"Historique");
         g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BCHECK, L"Check update");
         g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BMARK,  L"Verifie");
-        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BCOPY,  L"Copier lien");
         g_hMods = MkList(hwnd, IDC_MODLIST);
         g_pageMods[g_nMods++] = g_hMods;
-        AddCol(g_hMods, 0, L"Mod", 210);
-        AddCol(g_hMods, 1, L"Categorie", 130);
-        AddCol(g_hMods, 2, L"Derniere verif", 130);
-        AddCol(g_hMods, 3, L"Age", 60);
-        AddCol(g_hMods, 4, L"Lien", 320);
-        AddCol(g_hMods, 5, L"Note", 180);
+        AddCol(g_hMods, COL_NAME,      L"Mod", 200);
+        AddCol(g_hMods, COL_CAT,       L"Categorie", 120);
+        AddCol(g_hMods, COL_LASTCHECK, L"Derniere verif", 120);
+        AddCol(g_hMods, COL_AGE,       L"Age", 55);
+        AddCol(g_hMods, COL_DLL,       L"DLL", 190);
+        AddCol(g_hMods, COL_URL,       L"Lien", 260);
+        AddCol(g_hMods, COL_NOTE,      L"Note", 160);
+
+        // icone par mod : petite image list 16x16 alimentee a la volee
+        // (voir GetOrLoadIcon) via GDI+, avec une icone grise par defaut.
+        g_imgList = ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, 8, 32);
+        if (g_imgList) {
+            HICON def = MakeDefaultIcon(16);
+            g_defaultIconIdx = def ? ImageList_AddIcon(g_imgList, def) : -1;
+            if (def) DestroyIcon(def);
+            ListView_SetImageList(g_hMods, g_imgList, LVSIL_SMALL);
+        }
+
+        // info-bulles sur les boutons : repond a "a quoi sert ce bouton ?"
+        // directement dans l'interface plutot que dans une doc a part.
+        g_hTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL,
+            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+            hwnd, NULL, g_hInst, NULL);
+        if (g_hTooltip) {
+            SetWindowPos(g_hTooltip, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            AddTip(GetDlgItem(hwnd, IDC_BADD),   L"Ajoute un nouveau mod a la liste");
+            AddTip(GetDlgItem(hwnd, IDC_BEDIT),  L"Modifie le mod selectionne");
+            AddTip(GetDlgItem(hwnd, IDC_BDEL),   L"Retire la fiche du mod (ne desinstalle rien)");
+            AddTip(GetDlgItem(hwnd, IDC_BCOPY),  L"Copie le lien du mod dans le presse-papier");
+            AddTip(GetDlgItem(hwnd, IDC_BWATCH), L"Ouvre la page du mod dans le navigateur");
+            AddTip(GetDlgItem(hwnd, IDC_BHIST),  L"Ouvre la page d'historique / changelog du mod");
+            AddTip(GetDlgItem(hwnd, IDC_BCHECK), L"Ouvre la page du mod ET note la date de verification du jour");
+            AddTip(GetDlgItem(hwnd, IDC_BMARK),
+                L"Note la date de verification SANS ouvrir de lien - utile si tu as deja "
+                L"verifie ailleurs (Discord du mod, changelog deja ouvert dans un autre onglet...)");
+        }
+
 
         // page sauvegardes
         g_nSaves = 0;
@@ -995,9 +1329,20 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_BEDIT:  ActionEdit(hwnd);         return 0;
         case IDC_BDEL:   ActionDelete(hwnd);       return 0;
         case IDC_BWATCH: ActionOpen(hwnd, false);  return 0;
+        case IDC_BHIST:  ActionOpenHistory(hwnd);  return 0;
         case IDC_BCHECK: ActionOpen(hwnd, true);   return 0;
         case IDC_BMARK:  ActionMark(hwnd);         return 0;
         case IDC_BCOPY:  ActionCopy(hwnd);         return 0;
+
+        case IDM_CTX_WATCH:       ActionOpen(hwnd, false); return 0;
+        case IDM_CTX_HIST:        ActionOpenHistory(hwnd); return 0;
+        case IDM_CTX_CHECK:       ActionOpen(hwnd, true);  return 0;
+        case IDM_CTX_MARK:        ActionMark(hwnd);        return 0;
+        case IDM_CTX_LOCATE_DLL:  ActionLocateDll(hwnd);   return 0;
+        case IDM_CTX_OPEN_DLLDIR: ActionOpenDllDir(hwnd);  return 0;
+        case IDM_CTX_COPY:        ActionCopy(hwnd);        return 0;
+        case IDM_CTX_EDIT:        ActionEdit(hwnd);        return 0;
+        case IDM_CTX_DELETE:      ActionDelete(hwnd);      return 0;
 
         case IDC_BREFRESH:  RefreshSaves(); return 0;
         case IDC_BOPENSAVE: OpenFolder(hwnd, SavesRoot(), L"sauvegardes"); return 0;
@@ -1017,11 +1362,17 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::wstring about =
                 L"ValMods " + U2W(VALMODS_VERSION) + L" - gestionnaire manuel de mods Valheim\n\n";
             about +=
-                L"Watch          : ouvre le lien\n"
-                L"Check update   : ouvre le lien + horodate la verification\n"
-                L"Verifie        : horodate sans ouvrir\n"
-                L"Double-clic    : ouvre le lien\n"
+                L"Watch          : ouvre la page du mod\n"
+                L"Historique     : ouvre la page des changements / versions\n"
+                L"Check update   : ouvre la page du mod ET note la date de verification\n"
+                L"Verifie        : note la date de verification SANS ouvrir de lien\n"
+                L"                 (utile si tu as deja verifie ailleurs : Discord du\n"
+                L"                 mod, changelog deja ouvert dans un autre onglet...)\n\n"
+                L"Double-clic sur un mod : ouvre son lien\n"
+                L"Clic droit sur un mod  : menu avec toutes les actions, y compris le DLL\n"
                 L"Clic sur un en-tete de colonne : tri\n\n"
+                L"La colonne DLL indique si le fichier associe au mod est present (vert),\n"
+                L"manquant (rouge) ou non renseigne (gris).\n\n"
                 L"Les mods non verifies depuis plus de 30 jours sont en rouge,\n"
                 L"ceux jamais verifies en gris.\n\n"
                 L"Donnees : valmods.json, a cote de l'exe.";
@@ -1046,6 +1397,28 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 RefillMods();
                 return 0;
             }
+            if (nh->code == NM_RCLICK) {
+                LPNMITEMACTIVATE ia = (LPNMITEMACTIVATE)lp;
+                if (ia->iItem >= 0) SelectMod(ia->iItem);
+                if (SelectedMod() >= 0) {
+                    POINT pt; GetCursorPos(&pt);
+                    HMENU m = CreatePopupMenu();
+                    AppendMenuW(m, MF_STRING, IDM_CTX_WATCH,       L"Ouvrir le lien (Watch)");
+                    AppendMenuW(m, MF_STRING, IDM_CTX_HIST,        L"Ouvrir l'historique des versions");
+                    AppendMenuW(m, MF_STRING, IDM_CTX_CHECK,       L"Ouvrir le lien + noter la verification");
+                    AppendMenuW(m, MF_STRING, IDM_CTX_MARK,        L"Noter la verification (sans ouvrir)");
+                    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+                    AppendMenuW(m, MF_STRING, IDM_CTX_LOCATE_DLL,  L"Localiser le DLL dans l'explorateur");
+                    AppendMenuW(m, MF_STRING, IDM_CTX_OPEN_DLLDIR, L"Ouvrir le dossier du DLL");
+                    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+                    AppendMenuW(m, MF_STRING, IDM_CTX_COPY,        L"Copier le lien");
+                    AppendMenuW(m, MF_STRING, IDM_CTX_EDIT,        L"Modifier...");
+                    AppendMenuW(m, MF_STRING, IDM_CTX_DELETE,      L"Supprimer");
+                    TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+                    DestroyMenu(m);
+                }
+                return 0;
+            }
             if (nh->code == NM_CUSTOMDRAW) {
                 LPNMLVCUSTOMDRAW cd = (LPNMLVCUSTOMDRAW)lp;
                 if (cd->nmcd.dwDrawStage == CDDS_PREPAINT)
@@ -1057,6 +1430,21 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         if (d < 0)        cd->clrText = RGB(130, 130, 130);
                         else if (d >= 30) cd->clrText = RGB(200, 40, 40);
                         else if (d >= 14) cd->clrText = RGB(190, 120, 0);
+                    }
+                    // on redemande un passage par sous-element pour pouvoir
+                    // surcharger juste la couleur de la colonne DLL en dessous.
+                    return CDRF_NOTIFYSUBITEMDRAW;
+                }
+                if (cd->nmcd.dwDrawStage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM)) {
+                    if (cd->iSubItem == COL_DLL) {
+                        size_t idx = (size_t)cd->nmcd.lItemlParam;
+                        if (idx < g_mods.size()) {
+                            bool missing = false;
+                            DllStatusText(g_mods[idx], &missing);
+                            if (missing)                            cd->clrText = RGB(200, 40, 40);
+                            else if (!g_mods[idx].dllPath.empty())  cd->clrText = RGB(40, 130, 60);
+                            else                                     cd->clrText = RGB(130, 130, 130);
+                        }
                     }
                     return CDRF_DODEFAULT;
                 }
@@ -1116,10 +1504,19 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
     g_hInst = hInst;
     OleInitialize(NULL);
 
+    // ICC_WIN95_CLASSES couvre entre autres les tooltips (TOOLTIPS_CLASSW)
+    // utilises pour les info-bulles des boutons, en plus des listes/onglets.
     INITCOMMONCONTROLSEX ic;
     ic.dwSize = sizeof(ic);
-    ic.dwICC = ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_STANDARD_CLASSES;
+    ic.dwICC = ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&ic);
+
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    Gdiplus::Status gdiStatus =
+        Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, NULL);
+    // Si GDI+ echoue a s'initialiser (tres rare), on continue quand meme :
+    // GetOrLoadIcon retombe alors sur g_defaultIconIdx == -1, donc simplement
+    // aucune icone affichee plutot qu'un crash.
 
     NONCLIENTMETRICSW ncm;
     ncm.cbSize = sizeof(ncm);
@@ -1156,6 +1553,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
         }
     }
     (void)hAcc;
+
+    if (g_imgList) { ImageList_Destroy(g_imgList); g_imgList = NULL; }
+    if (gdiStatus == Gdiplus::Ok) Gdiplus::GdiplusShutdown(g_gdiplusToken);
     OleUninitialize();
     return (int)msg.wParam;
 }

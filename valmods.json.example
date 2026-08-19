@@ -1,11 +1,14 @@
 {
-  "version": 1,
+  "version": 2,
   "valheimDir": "",
   "mods": [
     {
       "name": "Exemple - BepInExPack Valheim",
       "category": "Framework (obligatoire pour les autres mods)",
       "url": "https://thunderstore.io/c/valheim/p/denikson/BepInExPack_Valheim/",
+      "changelogUrl": "",
+      "dllPath": "",
+      "iconPath": "",
       "lastCheck": "",
       "note": "Supprime cette ligne, c'est juste un exemple."
     }
