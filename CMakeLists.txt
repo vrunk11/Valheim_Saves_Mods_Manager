@@ -26,6 +26,14 @@ endif()
 
 if(MSVC)
     target_compile_options(valmods PRIVATE /utf-8 /W3)
+    # valmods.rc embeds its own RT_MANIFEST (resource ID 1, for DPI-awareness
+    # and the common-controls v6 dependency). MSVC's linker also auto-generates
+    # and embeds a manifest at that same ID by default (/MANIFEST), and the two
+    # collide during resource conversion:
+    #   CVTRES fatal error CVT1100: duplicate resource. type:MANIFEST, name:1
+    # /MANIFEST:NO tells the linker to leave manifest embedding entirely to
+    # valmods.rc instead of also generating its own.
+    target_link_options(valmods PRIVATE /MANIFEST:NO)
 endif()
 
 install(TARGETS valmods RUNTIME DESTINATION .)
