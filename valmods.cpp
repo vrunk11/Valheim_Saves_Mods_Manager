@@ -72,6 +72,8 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDM_GAMEDIR    2006
 #define IDM_SETDIR     2007
 #define IDM_ABOUT      2008
+
+#define VALMODS_VERSION "1.1.0"
 #define IDM_BEPINEX    2009
 
 // ---------------------------------------------------------------- donnees
@@ -1081,8 +1083,6 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
-
-#define VALMODS_VERSION "1.1.0"
 
 // GUI app (/SUBSYSTEM:WINDOWS) has no console by default, so plain printf
 // goes nowhere. --version reattaches to the parent console (if the exe was
