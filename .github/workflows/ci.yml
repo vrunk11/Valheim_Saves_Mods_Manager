@@ -1,0 +1,91 @@
+name: CI and Release
+
+# WHY THIS WORKFLOW IS SIMPLE
+#
+# ValMods is a single Win32 executable with zero external dependencies
+# (no SDK checkout, no vcpkg manifest, no submodules). windows-latest ships
+# MSVC out of the box, so `cmake -B build` picks the Visual Studio generator
+# automatically — no toolchain setup step needed. There is deliberately no
+# build matrix: this project doesn't target Linux or macOS.
+#
+# Two jobs:
+#   build   - on every push/PR: configure, build Release, sanity-check the
+#             exe actually launches (--version), upload it as a workflow
+#             artifact so a PR's build can be downloaded and tried.
+#   release - only on a `vX.Y.Z` tag: re-download that build's artifact and
+#             publish it as a GitHub release asset, zipped alongside
+#             valmods.json.example so a fresh download has something to look
+#             at before first launch.
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # No test suite yet (it's a ~700-line GUI app with no headless logic
+      # to speak of) — this is a smoke test, not coverage. It only proves
+      # the binary launches and isn't missing a DLL; --version must exit 0
+      # without opening a window, or this step would hang the runner.
+      - name: Sanity check the binary
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse -Path build -Filter valmods.exe | Select-Object -First 1
+          if (-not $exe) { throw "valmods.exe not found under build/" }
+          & $exe.FullName --version
+          if ($LASTEXITCODE -ne 0) { throw "valmods.exe --version exited $LASTEXITCODE" }
+          echo "EXE_PATH=$($exe.FullName)" >> $env:GITHUB_ENV
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: valmods-windows
+          path: ${{ env.EXE_PATH }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # Only needed for valmods.json.example, bundled into the release zip
+        # below so a first-time user has a template instead of a blank app.
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: valmods-windows
+          path: dist
+
+      - name: Assemble release zip
+        run: |
+          mkdir -p release
+          cp dist/valmods.exe release/
+          cp valmods.json.example release/ 2>/dev/null || true
+          cp README.md release/
+          cd release && zip -r ../valmods-${{ github.ref_name }}-windows.zip .
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: valmods-${{ github.ref_name }}-windows.zip
+          generate_release_notes: true

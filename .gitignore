@@ -1,0 +1,23 @@
+# dossiers de build CMake
+build/
+build-*/
+out/
+
+# artefacts de compilation
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# donnees locales de l'appli (ne pas versionner ta propre liste de mods)
+valmods.json
+valmods.json.bad
+valmods.tsv
+valmods.ini
+backups/
+
+# IDE
+.vs/
+.vscode/
+CMakeUserPresets.json
