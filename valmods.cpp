@@ -28,6 +28,9 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX            // gdiplus.h utilise std::min/max ; les macros
                              // min/max de windows.h les masqueraient sinon.
+#define WINVER 0x0600        // sans ca, des macros comme SS_END_ELLIPSIS
+                             // restent gardees derriere #if(WINVER >= ...)
+                             // dans winuser.h et ne se declarent pas.
 #define _WIN32_WINNT 0x0600
 
 #include <windows.h>
@@ -1021,6 +1024,11 @@ static std::wstring BuildDetailsLine(const Mod& m) {
     s += L"  |  TS : " + TsStatusText(m, NULL);
     return s;
 }
+
+// definie plus bas (pres de MkButton/AddCol), mais RefillMods l'utilise des
+// ici pour les info-bulles des boutons de chaque carte : declaration
+// anticipee pour eviter d'imposer un ordre de sections dans le fichier.
+static void AddTip(HWND ctrl, const wchar_t* text);
 
 // ---------------------------------------------------------------- liste mods
 // Vue en "cartes" (pas un tableau) : chaque mod est une ligne haute avec une
