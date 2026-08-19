@@ -34,6 +34,10 @@ l'appli se contente de retenir tes liens et la date où tu les as vérifiés.
     `thunderstore.io` (Nexus/GitHub n'ont pas d'équivalent aussi simple
     sans clé d'API). L'appel réseau est synchrone et déclenché mod par
     mod sur clic explicite — pas de vérification automatique en masse.
+  - **Télécharger** : récupère le zip de la dernière version (via l'URL de
+    téléchargement officielle de Thunderstore) et l'enregistre dans
+    `downloads/` à côté de l'exe. Ne l'extrait **jamais** automatiquement —
+    ValMods reste manuel, c'est à toi de le déposer dans `BepInEx/plugins`.
 - Accès rapide aux dossiers `BepInEx/plugins`, `BepInEx/config`, dossier du
   jeu, dossier du DLL d'un mod donné.
 - Onglet Sauvegardes : liste des mondes et personnages (taille, date), backup

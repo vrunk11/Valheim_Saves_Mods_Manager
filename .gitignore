@@ -17,6 +17,7 @@ valmods.tsv
 valmods.ini
 backups/
 icons/
+downloads/
 
 # IDE
 .vs/

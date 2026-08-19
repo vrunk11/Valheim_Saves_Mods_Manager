@@ -74,6 +74,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_BCOPY      1008
 #define IDC_BHIST      1009
 #define IDC_BTSCHECK   1018
+#define IDC_BDOWNLOAD  1019
 #define IDC_WORLDS     1010
 #define IDC_CHARS      1011
 #define IDC_LBL1       1012
@@ -92,6 +93,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDM_SETDIR     2007
 #define IDM_ABOUT      2008
 #define IDM_BEPINEX    2009
+#define IDM_DOWNLOADS  2010
 
 // menu contextuel (clic droit) sur une ligne de la liste des mods
 #define IDM_CTX_WATCH       2100
@@ -104,6 +106,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDM_CTX_EDIT        2107
 #define IDM_CTX_DELETE      2108
 #define IDM_CTX_TSCHECK     2109
+#define IDM_CTX_DOWNLOAD    2110
 
 // boutons propres a la fenetre d'edition d'un mod
 #define IDC_E_BROWSEDLL   3001
@@ -402,6 +405,7 @@ static std::wstring PluginsDir() { return g_valheimDir.empty() ? L"" : g_valheim
 static std::wstring ConfigDir()  { return g_valheimDir.empty() ? L"" : g_valheimDir + L"\\BepInEx\\config"; }
 static std::wstring BepInExDir() { return g_valheimDir.empty() ? L"" : g_valheimDir + L"\\BepInEx"; }
 static std::wstring BackupRoot() { return ExeDir() + L"\\backups"; }
+static std::wstring DownloadsRoot() { return ExeDir() + L"\\downloads"; }
 
 static std::wstring RegSteamPath() {
     HKEY k;
@@ -695,12 +699,16 @@ static bool VersionLess(const std::wstring& a, const std::wstring& b) {
 
 // Requete HTTPS GET minimale via WinHTTP (natif Windows, aucune dependance).
 // Malgre le nom historique, ceci lit des octets bruts, pas forcement de
-// l'UTF-8 : reutilise a la fois pour le JSON de l'API et pour telecharger
-// les icones PNG des mods (voir FetchThunderstoreAutofill plus bas).
+// l'UTF-8 : reutilise a la fois pour le JSON de l'API, les icones PNG et les
+// zips de mods (voir DownloadThunderstoreZip plus bas).
+// maxBytes (0 = illimite) coupe le telechargement si la reponse depasse
+// cette taille - garde-fou pour un zip anormalement gros plutot que de
+// remplir la RAM sans limite.
 // Timeouts volontairement courts (resolution/connexion 5s, envoi/reception 8s)
 // pour ne pas bloquer l'interface trop longtemps en cas de reseau absent.
 static bool HttpGetBytes(const std::wstring& host, const std::wstring& path,
-                         std::string& outBody, DWORD& outStatus, std::wstring& errOut)
+                         std::string& outBody, DWORD& outStatus, std::wstring& errOut,
+                         size_t maxBytes = 0)
 {
     outBody.clear(); outStatus = 0; errOut.clear();
     HINTERNET hSession = WinHttpOpen(L"ValMods (Windows)", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -736,6 +744,7 @@ static bool HttpGetBytes(const std::wstring& host, const std::wstring& path,
     WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
         WINHTTP_HEADER_NAME_BY_INDEX, &outStatus, &statusSize, WINHTTP_NO_HEADER_INDEX);
 
+    bool tooBig = false;
     for (;;) {
         DWORD avail = 0;
         if (!WinHttpQueryDataAvailable(hRequest, &avail) || avail == 0) break;
@@ -743,11 +752,18 @@ static bool HttpGetBytes(const std::wstring& host, const std::wstring& path,
         DWORD got = 0;
         if (!WinHttpReadData(hRequest, &buf[0], avail, &got)) break;
         outBody.append(&buf[0], got);
+        if (maxBytes && outBody.size() > maxBytes) { tooBig = true; break; }
     }
 
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
+
+    if (tooBig) {
+        errOut = L"Reponse trop volumineuse (limite de securite depassee).";
+        outBody.clear();
+        return false;
+    }
     return outStatus != 0;
 }
 // Decoupe une URL https://host/chemin en host + chemin, pour WinHttpConnect
@@ -814,24 +830,18 @@ static TsFetchResult FetchThunderstorePackage(const std::wstring& modUrl) {
     r.ok = true;
     return r;
 }
-// Trouve, dans le tableau "versions" du JSON, l'entree ayant le plus haut
-// numero de version (le tri renvoye par l'API n'est pas garanti). Renvoie
-// NULL si aucune version exploitable n'a ete trouvee.
-static const mj::Value* FindLatestVersionEntry(const mj::Value& root, std::wstring& outVersion) {
+// L'API renvoie directement la derniere version publiee dans un objet
+// "latest" (confirme sur une reponse reelle de l'API) - PAS dans un tableau
+// "versions" a parcourir comme on pourrait le supposer. Renvoie NULL si
+// l'objet est absent ou n'a pas de version_number exploitable (mod retire,
+// reponse degradee...).
+static const mj::Value* FindLatestEntry(const mj::Value& root, std::wstring& outVersion) {
     outVersion.clear();
-    const mj::Value* versions = root.find("versions");
-    if (!versions || versions->type != mj::ARR) return NULL;
-    const mj::Value* best = NULL;
-    for (size_t i = 0; i < versions->arr.size(); ++i) {
-        if (versions->arr[i].type != mj::OBJ) continue;
-        std::wstring vn = U2W(versions->arr[i].s("version_number"));
-        if (vn.empty()) continue;
-        if (outVersion.empty() || VersionLess(outVersion, vn)) {
-            outVersion = vn;
-            best = &versions->arr[i];
-        }
-    }
-    return best;
+    const mj::Value* latest = root.find("latest");
+    if (!latest || latest->type != mj::OBJ) return NULL;
+    outVersion = U2W(latest->s("version_number"));
+    if (outVersion.empty()) return NULL;
+    return latest;
 }
 
 struct TsCheckResult {
@@ -851,8 +861,8 @@ static TsCheckResult CheckThunderstoreVersion(const std::wstring& modUrl) {
     if (!f.ok) { r.error = f.error; return r; }
 
     std::wstring latest;
-    if (!FindLatestVersionEntry(f.root, latest)) {
-        r.error = L"Aucune version exploitable listee pour ce mod dans la reponse.";
+    if (!FindLatestEntry(f.root, latest)) {
+        r.error = L"Numero de version introuvable dans la reponse (mod retire ou reponse degradee).";
         return r;
     }
     r.latestVersion = latest;
@@ -884,6 +894,9 @@ static TsAutofillResult FetchThunderstoreAutofill(const std::wstring& modUrl) {
 
     r.name = Clean(U2W(f.root.s("name")));
 
+    // "categories" n'existe pas sur cet endpoint (confirme sur une reponse
+    // reelle) - ce bloc ne trouvera donc jamais rien pour l'instant, garde
+    // au cas ou Thunderstore l'ajoute un jour ; ca ne casse rien si absent.
     const mj::Value* cats = f.root.find("categories");
     if (cats && cats->type == mj::ARR) {
         for (size_t i = 0; i < cats->arr.size(); ++i) {
@@ -894,8 +907,11 @@ static TsAutofillResult FetchThunderstoreAutofill(const std::wstring& modUrl) {
     }
 
     std::wstring latest;
-    const mj::Value* bestEntry = FindLatestVersionEntry(f.root, latest);
-    if (!bestEntry) { r.error = L"Aucune version exploitable listee pour ce mod dans la reponse."; return r; }
+    const mj::Value* bestEntry = FindLatestEntry(f.root, latest);
+    if (!bestEntry) {
+        r.error = L"Numero de version introuvable dans la reponse (mod retire ou reponse degradee).";
+        return r;
+    }
     r.latestVersion = latest;
 
     std::wstring changelog = modUrl;
@@ -923,6 +939,44 @@ static TsAutofillResult FetchThunderstoreAutofill(const std::wstring& modUrl) {
 
     r.ok = true;
     return r;
+}
+
+// Telecharge le zip de la version demandee via l'URL de telechargement
+// officielle de Thunderstore (celle utilisee par leur propre bouton
+// "Download" sur la page du mod) :
+//   https://thunderstore.io/package/download/{namespace}/{name}/{version}/
+// Enregistre le zip dans downloads/ a cote de l'exe. Ne l'extrait JAMAIS
+// automatiquement : ValMods reste un outil manuel, l'installation dans
+// BepInEx/plugins se fait a la main.
+static bool DownloadThunderstoreZip(const std::wstring& ns, const std::wstring& name,
+                                    const std::wstring& version,
+                                    std::wstring& outPath, std::wstring& errOut)
+{
+    std::wstring path = L"/package/download/" + ns + L"/" + name + L"/" + version + L"/";
+    std::string bytes; DWORD status = 0;
+    const size_t maxBytes = 200u * 1024u * 1024u;   // 200 Mo, garde-fou de securite
+    if (!HttpGetBytes(L"thunderstore.io", path, bytes, status, errOut, maxBytes)) {
+        if (errOut.empty()) errOut = L"Echec du telechargement.";
+        return false;
+    }
+    if (status == 404) {
+        errOut = L"Version introuvable sur Thunderstore (peut-etre retiree entre temps).";
+        return false;
+    }
+    if (status != 200) {
+        wchar_t b[64]; wsprintfW(b, L"Thunderstore a repondu avec le code %lu.", (unsigned long)status);
+        errOut = b;
+        return false;
+    }
+    if (bytes.empty()) { errOut = L"Fichier telecharge vide."; return false; }
+
+    MakeDirs(DownloadsRoot());
+    std::wstring fn = SanitizeFileName(ns) + L"-" + SanitizeFileName(name) + L"-" +
+                      SanitizeFileName(version) + L".zip";
+    std::wstring dest = DownloadsRoot() + L"\\" + fn;
+    if (!WriteAllBytes(dest, bytes)) { errOut = L"Impossible d'ecrire le fichier sur le disque."; return false; }
+    outPath = dest;
+    return true;
 }
 
 // Texte + categorie de couleur pour la colonne "MAJ" : 0 gris (inconnu),
@@ -1471,6 +1525,63 @@ static void ActionCheckThunderstore(HWND hwnd) {
               L"par son auteur sur Thunderstore.";
     Info(hwnd, msg.c_str());
 }
+static void ActionDownloadLatest(HWND hwnd) {
+    int i = SelectedMod();
+    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
+    std::wstring name = g_mods[i].name;
+    std::wstring url = g_mods[i].url;
+
+    std::wstring ns, pkgName;
+    if (!ParseThunderstoreUrl(url, ns, pkgName)) {
+        Info(hwnd, L"Le lien de ce mod ne pointe pas vers thunderstore.io :\n"
+                   L"le telechargement direct ne fonctionne que pour les mods\n"
+                   L"heberges sur Thunderstore.");
+        return;
+    }
+
+    HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
+
+    std::wstring version = g_mods[i].tsVersion;
+    if (version.empty()) {
+        // pas encore verifie : on va d'abord chercher la derniere version
+        TsCheckResult chk = CheckThunderstoreVersion(url);
+        if (!chk.ok) {
+            SetCursor(oldCursor);
+            std::wstring m = L"Impossible de determiner la derniere version :\n" + chk.error;
+            MessageBoxW(hwnd, m.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        version = chk.latestVersion;
+    }
+
+    std::wstring savedPath, err;
+    bool ok = DownloadThunderstoreZip(ns, pkgName, version, savedPath, err);
+    SetCursor(oldCursor);
+
+    if (!ok) {
+        std::wstring m = L"Telechargement impossible :\n" + err;
+        MessageBoxW(hwnd, m.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // confirme/rafraichit tsVersion + date de verification (le telechargement
+    // implique qu'on connait desormais la version exacte tres precisement)
+    for (size_t k = 0; k < g_mods.size(); ++k) {
+        if (g_mods[k].name == name) {
+            g_mods[k].tsVersion = version;
+            g_mods[k].last = NowStamp();
+            SaveMods();
+            RefillMods();
+            SelectMod((int)k);
+            break;
+        }
+    }
+
+    std::wstring msg = L"Version " + version + L" telechargee :\n" + savedPath +
+        L"\n\nA extraire toi-meme dans BepInEx\\plugins - ValMods ne modifie\n"
+        L"jamais tes fichiers de jeu automatiquement.";
+    Info(hwnd, msg.c_str());
+}
 
 // ---------------------------------------------------------------- parametres
 static int CALLBACK BrowseCB(HWND hwnd, UINT msg, LPARAM lp, LPARAM data) {
@@ -1520,12 +1631,12 @@ static void LayoutAll(HWND hwnd) {
     // --- onglet mods : deux rangees de boutons + liste
     const int bw = 104, bh = 28, gap = 6;
     int row1[4] = { IDC_BADD, IDC_BEDIT, IDC_BDEL, IDC_BCOPY };
-    int row2[5] = { IDC_BWATCH, IDC_BHIST, IDC_BCHECK, IDC_BMARK, IDC_BTSCHECK };
+    int row2[6] = { IDC_BWATCH, IDC_BHIST, IDC_BCHECK, IDC_BMARK, IDC_BTSCHECK, IDC_BDOWNLOAD };
     for (int i = 0; i < 4; ++i) {
         HWND b1 = GetDlgItem(hwnd, row1[i]);
         if (b1) MoveWindow(b1, px + i * (bw + gap), py, bw, bh, TRUE);
     }
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 6; ++i) {
         HWND b2 = GetDlgItem(hwnd, row2[i]);
         if (b2) MoveWindow(b2, px + i * (bw + gap), py + bh + gap, bw, bh, TRUE);
     }
@@ -1594,6 +1705,7 @@ static void BuildMenu(HWND hwnd) {
     AppendMenuW(d, MF_STRING, IDM_GAMEDIR, L"Dossier du jeu");
     AppendMenuW(d, MF_SEPARATOR, 0, NULL);
     AppendMenuW(d, MF_STRING, IDM_SAVES,   L"Sauvegardes (LocalLow)");
+    AppendMenuW(d, MF_STRING, IDM_DOWNLOADS, L"Telechargements (zips Thunderstore)");
     HMENU p = CreatePopupMenu();
     AppendMenuW(p, MF_STRING, IDM_SETDIR, L"Definir le dossier de Valheim...");
     HMENU a = CreatePopupMenu();
@@ -1643,6 +1755,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BCHECK, L"Check update");
         g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BMARK,  L"Verifie");
         g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BTSCHECK, L"Verif. TS");
+        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BDOWNLOAD, L"Telecharger");
         g_hMods = MkList(hwnd, IDC_MODLIST);
         g_pageMods[g_nMods++] = g_hMods;
         AddCol(g_hMods, COL_NAME,      L"Mod", 190);
@@ -1686,6 +1799,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             AddTip(GetDlgItem(hwnd, IDC_BTSCHECK),
                 L"Interroge l'API publique de Thunderstore pour connaitre la derniere "
                 L"version publiee (uniquement pour les mods heberges sur thunderstore.io)");
+            AddTip(GetDlgItem(hwnd, IDC_BDOWNLOAD),
+                L"Telecharge le zip de la derniere version dans downloads\\ - a extraire "
+                L"toi-meme dans BepInEx\\plugins (Thunderstore uniquement, rien n'est installe automatiquement)");
         }
 
 
@@ -1745,12 +1861,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_BMARK:  ActionMark(hwnd);         return 0;
         case IDC_BCOPY:  ActionCopy(hwnd);         return 0;
         case IDC_BTSCHECK: ActionCheckThunderstore(hwnd); return 0;
+        case IDC_BDOWNLOAD: ActionDownloadLatest(hwnd); return 0;
 
         case IDM_CTX_WATCH:       ActionOpen(hwnd, false); return 0;
         case IDM_CTX_HIST:        ActionOpenHistory(hwnd); return 0;
         case IDM_CTX_CHECK:       ActionOpen(hwnd, true);  return 0;
         case IDM_CTX_MARK:        ActionMark(hwnd);        return 0;
         case IDM_CTX_TSCHECK:     ActionCheckThunderstore(hwnd); return 0;
+        case IDM_CTX_DOWNLOAD:    ActionDownloadLatest(hwnd);    return 0;
         case IDM_CTX_LOCATE_DLL:  ActionLocateDll(hwnd);   return 0;
         case IDM_CTX_OPEN_DLLDIR: ActionOpenDllDir(hwnd);  return 0;
         case IDM_CTX_COPY:        ActionCopy(hwnd);        return 0;
@@ -1768,6 +1886,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_BEPINEX:  OpenFolder(hwnd, BepInExDir(), L"BepInEx");          return 0;
         case IDM_GAMEDIR:  OpenFolder(hwnd, g_valheimDir, L"dossier du jeu");   return 0;
         case IDM_SAVES:    OpenFolder(hwnd, SavesRoot(),  L"sauvegardes");      return 0;
+        case IDM_DOWNLOADS: MakeDirs(DownloadsRoot());
+                            OpenFolder(hwnd, DownloadsRoot(), L"telechargements"); return 0;
         case IDM_OPENDATA: OpenFolder(hwnd, ExeDir(),     L"donnees");          return 0;
         case IDM_SETDIR:   ChooseValheimDir(hwnd); UpdateTitle(); return 0;
         case IDM_EXIT:     DestroyWindow(hwnd); return 0;
@@ -1794,6 +1914,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 L"Dans l'editeur, Auto-remplir depuis Thunderstore recupere le nom, la\n"
                 L"categorie, le lien historique, la derniere version et l'icone du mod\n"
                 L"a partir du lien colle (meme limite : Thunderstore uniquement).\n\n"
+                L"Telecharger recupere le zip de la derniere version dans downloads\\ -\n"
+                L"a extraire toi-meme dans BepInEx\\plugins, rien n'est installe\n"
+                L"automatiquement.\n\n"
                 L"Les mods non verifies depuis plus de 30 jours sont en rouge,\n"
                 L"ceux jamais verifies en gris.\n\n"
                 L"Donnees : valmods.json, a cote de l'exe.";
@@ -1829,6 +1952,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     AppendMenuW(m, MF_STRING, IDM_CTX_CHECK,       L"Ouvrir le lien + noter la verification");
                     AppendMenuW(m, MF_STRING, IDM_CTX_MARK,        L"Noter la verification (sans ouvrir)");
                     AppendMenuW(m, MF_STRING, IDM_CTX_TSCHECK,     L"Verifier la derniere version (Thunderstore)");
+                    AppendMenuW(m, MF_STRING, IDM_CTX_DOWNLOAD,    L"Telecharger la derniere version (.zip)");
                     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
                     AppendMenuW(m, MF_STRING, IDM_CTX_LOCATE_DLL,  L"Localiser le DLL dans l'explorateur");
                     AppendMenuW(m, MF_STRING, IDM_CTX_OPEN_DLLDIR, L"Ouvrir le dossier du DLL");
