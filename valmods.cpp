@@ -1,13 +1,16 @@
 // ============================================================================
 //  ValMods - petit gestionnaire manuel de mods Valheim (Win32 natif, C++)
-//  - liste de mods (icone / nom / categorie / lien / historique / DLL lie /
-//    derniere verification / note)
-//  - bouton "Watch"        : ouvre le lien du mod
-//  - bouton "Historique"   : ouvre la page des changements / versions
-//  - bouton "Check update" : ouvre le lien ET horodate la verification
-//  - bouton "Verifie"      : horodate SANS ouvrir (deja verifie ailleurs)
-//  - clic droit sur un mod : menu avec toutes les actions + DLL
-//  - acces rapide aux dossiers plugins / config / sauvegardes
+//  - vue en cartes (pas un tableau) : icone visible, nom, petits details
+//    (categorie / derniere verif / etat DLL / etat Thunderstore / note),
+//    et les boutons d'action directement sur chaque ligne
+//  - bouton "Watch"   : ouvre le lien du mod        "Hist." : historique
+//  - bouton "Check+"  : ouvre le lien + horodate     "OK"   : horodate sans ouvrir
+//  - bouton "TS"      : verifie la derniere version sur Thunderstore
+//  - bouton "DL"      : telecharge le zip (demande ou l'enregistrer)
+//  - bouton "Modif."  : modifie le mod               "..."  : copier lien /
+//    localiser le DLL / ouvrir son dossier / supprimer
+//  - tri via un menu deroulant + un bouton croissant/decroissant
+//  - acces rapide aux dossiers plugins / config / sauvegardes / telechargements
 //  - onglet Sauvegardes : liste des mondes et des personnages + backup
 //
 //  Aucune dependance externe : GDI+ (icones) et Common Dialogs (parcourir)
@@ -64,17 +67,9 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // ---------------------------------------------------------------- identifiants
 #define IDC_TAB        1000
-#define IDC_MODLIST    1001
 #define IDC_BADD       1002
-#define IDC_BEDIT      1003
-#define IDC_BDEL       1004
-#define IDC_BWATCH     1005
-#define IDC_BCHECK     1006
-#define IDC_BMARK      1007
-#define IDC_BCOPY      1008
-#define IDC_BHIST      1009
-#define IDC_BTSCHECK   1018
-#define IDC_BDOWNLOAD  1019
+#define IDC_SORTCOMBO  1018
+#define IDC_SORTDIR    1019
 #define IDC_WORLDS     1010
 #define IDC_CHARS      1011
 #define IDC_LBL1       1012
@@ -83,6 +78,14 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_BOPENSAVE  1015
 #define IDC_BBACKUP    1016
 #define IDC_BOPENBK    1017
+
+// actions sur une ligne (carte) de mod : bouton dynamique = RA_BASE +
+// index_ligne * RA_COUNT + action. LOWORD(wParam) de WM_COMMAND est un
+// entier 16 bits (0-65535), donc jusqu'a (65535-RA_BASE)/RA_COUNT lignes
+// possibles - tres largement suffisant pour une liste de mods reelle.
+#define RA_BASE  5000
+enum { RA_WATCH = 0, RA_HIST = 1, RA_CHECK = 2, RA_MARK = 3, RA_TS = 4,
+       RA_DL = 5, RA_EDIT = 6, RA_MORE = 7, RA_COUNT = 8 };
 
 #define IDM_OPENDATA   2001
 #define IDM_EXIT       2002
@@ -95,18 +98,13 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDM_BEPINEX    2009
 #define IDM_DOWNLOADS  2010
 
-// menu contextuel (clic droit) sur une ligne de la liste des mods
-#define IDM_CTX_WATCH       2100
-#define IDM_CTX_HIST        2101
-#define IDM_CTX_CHECK       2102
-#define IDM_CTX_MARK        2103
+// menu "..." (actions moins frequentes) sur une carte de mod - les actions
+// courantes (Watch/Historique/Check/Verifie/TS/Telecharger/Modifier) sont
+// deja des boutons directs sur la carte, inutile de les dupliquer ici.
 #define IDM_CTX_LOCATE_DLL  2104
 #define IDM_CTX_OPEN_DLLDIR 2105
 #define IDM_CTX_COPY        2106
-#define IDM_CTX_EDIT        2107
 #define IDM_CTX_DELETE      2108
-#define IDM_CTX_TSCHECK     2109
-#define IDM_CTX_DOWNLOAD    2110
 
 // boutons propres a la fenetre d'edition d'un mod
 #define IDC_E_BROWSEDLL   3001
@@ -116,8 +114,8 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #define VALMODS_VERSION "1.2.0"
 
-// indices des colonnes de la liste des mods (utilises pour le tri et le
-// dessin personnalise des colonnes DLL / MAJ Thunderstore)
+// "colonnes" au sens tri uniquement desormais (il n'y a plus de tableau) :
+// meme enum reutilise par ModLess et par le menu deroulant de tri.
 enum { COL_NAME = 0, COL_CAT = 1, COL_LASTCHECK = 2, COL_AGE = 3,
        COL_DLL = 4, COL_TSVER = 5, COL_URL = 6, COL_NOTE = 7 };
 
@@ -127,24 +125,32 @@ struct Mod {
 };
 
 static HINSTANCE g_hInst = NULL;
-static HWND  g_hMain = NULL, g_hTab = NULL, g_hMods = NULL;
+static HWND  g_hMain = NULL, g_hTab = NULL;
+static HWND  g_hCardsHost = NULL;       // panneau scrollable "cartes" (onglet Mods)
 static HWND  g_hWorlds = NULL, g_hChars = NULL;
 static HWND  g_hTooltip = NULL;
-static HFONT g_font = NULL;
+static HFONT g_font = NULL, g_fontBold = NULL;
 static std::vector<Mod> g_mods;
 static std::wstring g_valheimDir;
 static int  g_sortCol = 0;
 static bool g_sortAsc = true;
 static bool g_lastListIsWorld = true;   // pour le bouton backup
+static int  g_ctxMenuModIndex = -1;     // cible du menu "..." (voir ShowRowOverflowMenu)
 
 static ULONG_PTR g_gdiplusToken = 0;
-static HIMAGELIST g_imgList = NULL;
-static int g_defaultIconIdx = -1;
-static std::map<std::wstring, int> g_iconCache;   // chemin icone -> index image list
+static HICON g_defaultIcon = NULL;
+static std::map<std::wstring, HICON> g_iconCache;   // chemin icone -> icone chargee (GDI+)
 
-// 8 boutons + la liste sur l'onglet Mods : la taille doit rester >= au
-// nombre d'elements pousses dans WM_CREATE, sous peine d'ecrire hors
-// tableau (c'etait juste-juste a 8 avant l'ajout du bouton Historique).
+// controles crees dynamiquement pour chaque carte de mod (detruits et
+// recrees a chaque RefillMods). "stretch" = la largeur est recalculee a
+// chaque redimensionnement/scroll pour occuper le panneau (nom/details/
+// note/separateur) ; sinon la largeur reste fixe (icone, boutons).
+struct CardChild { HWND hwnd; int x, y, w, h; bool stretch; };
+static std::vector<CardChild> g_cardChildren;
+static int g_cardTotalHeight = 0;
+static int g_scrollPos = 0;
+
+// la taille doit rester >= au nombre d'elements pousses dans WM_CREATE.
 static HWND g_pageMods[16];  static int g_nMods = 0;
 static HWND g_pageSaves[8];  static int g_nSaves = 0;
 
@@ -294,23 +300,23 @@ static HICON LoadScaledIconFromFile(const std::wstring& path, int size) {
     if (dest.GetHICON(&h) != Gdiplus::Ok) return NULL;
     return h;
 }
-// Index dans l'image list (16x16) pour ce chemin d'icone, charge et mis en
-// cache au premier appel ; un chemin vide ou illisible retombe sur l'icone
-// par defaut. Le cache n'est PAS invalide si le fichier change sur disque a
-// chemin egal - re-parcourir le fichier dans l'editeur force un rechargement.
-static int GetOrLoadIcon(const std::wstring& path) {
-    if (path.empty() || !g_imgList) return g_defaultIconIdx;
-    std::map<std::wstring, int>::iterator it = g_iconCache.find(path);
+// Icone (40x40, taille des cartes) pour ce chemin, chargee et mise en cache
+// au premier appel ; un chemin vide ou illisible retombe sur l'icone par
+// defaut PARTAGEE (g_defaultIcon) SANS la mettre en cache, pour ne jamais
+// risquer de detruire deux fois le meme HICON au nettoyage final (voir
+// wWinMain) - seuls les chargements reussis, chacun un HICON distinct,
+// entrent dans g_iconCache. Le cache n'est pas invalide si le fichier
+// change sur disque a chemin egal - re-parcourir le fichier dans l'editeur
+// force un rechargement (nouveau HICON, ancien jamais libere avant la fin
+// de l'appli : negligeable pour le nombre d'icones qu'un usage normal genere).
+static HICON GetOrLoadHIcon(const std::wstring& path) {
+    if (path.empty()) return g_defaultIcon;
+    std::map<std::wstring, HICON>::iterator it = g_iconCache.find(path);
     if (it != g_iconCache.end()) return it->second;
-    HICON hi = LoadScaledIconFromFile(path, 16);
-    int idx = g_defaultIconIdx;
-    if (hi) {
-        int added = ImageList_AddIcon(g_imgList, hi);
-        DestroyIcon(hi);
-        if (added >= 0) idx = added;
-    }
-    g_iconCache[path] = idx;
-    return idx;
+    HICON hi = LoadScaledIconFromFile(path, 40);
+    if (!hi) return g_defaultIcon;
+    g_iconCache[path] = hi;
+    return hi;
 }
 
 // --- lecture / ecriture de fichiers via l'API Win32 (chemins Unicode surs) ---
@@ -949,8 +955,8 @@ static TsAutofillResult FetchThunderstoreAutofill(const std::wstring& modUrl) {
 // automatiquement : ValMods reste un outil manuel, l'installation dans
 // BepInEx/plugins se fait a la main.
 static bool DownloadThunderstoreZip(const std::wstring& ns, const std::wstring& name,
-                                    const std::wstring& version,
-                                    std::wstring& outPath, std::wstring& errOut)
+                                    const std::wstring& version, const std::wstring& destPath,
+                                    std::wstring& errOut)
 {
     std::wstring path = L"/package/download/" + ns + L"/" + name + L"/" + version + L"/";
     std::string bytes; DWORD status = 0;
@@ -969,17 +975,12 @@ static bool DownloadThunderstoreZip(const std::wstring& ns, const std::wstring& 
         return false;
     }
     if (bytes.empty()) { errOut = L"Fichier telecharge vide."; return false; }
-
-    MakeDirs(DownloadsRoot());
-    std::wstring fn = SanitizeFileName(ns) + L"-" + SanitizeFileName(name) + L"-" +
-                      SanitizeFileName(version) + L".zip";
-    std::wstring dest = DownloadsRoot() + L"\\" + fn;
-    if (!WriteAllBytes(dest, bytes)) { errOut = L"Impossible d'ecrire le fichier sur le disque."; return false; }
-    outPath = dest;
+    if (!WriteAllBytes(destPath, bytes)) { errOut = L"Impossible d'ecrire le fichier sur le disque."; return false; }
     return true;
 }
 
-// Texte + categorie de couleur pour la colonne "MAJ" : 0 gris (inconnu),
+// Texte + categorie de couleur pour l'etat Thunderstore (integre a la ligne
+// de details de chaque carte) : 0 gris (inconnu),
 // 1 vert (a jour), 2 rouge (mise a jour disponible).
 static std::wstring TsStatusText(const Mod& m, int* colorCategory) {
     if (colorCategory) *colorCategory = 0;
@@ -994,39 +995,163 @@ static std::wstring TsStatusText(const Mod& m, int* colorCategory) {
     return m.tsVersion + L" (a jour)";
 }
 
+// Une seule couleur "dominante" par carte plutot que par segment : plus
+// simple et plus lisible qu'une phrase multicolore. Priorite : probleme
+// concret (DLL manquant / mise a jour disponible) avant l'anciennete de
+// la derniere verification.
+static COLORREF RowStatusColor(const Mod& m) {
+    bool dllMissing = false;
+    DllStatusText(m, &dllMissing);
+    if (dllMissing) return RGB(200, 40, 40);
+    int tsCat = 0;
+    TsStatusText(m, &tsCat);
+    if (tsCat == 2) return RGB(200, 40, 40);
+    int d = DaysSince(m.last);
+    if (d < 0) return RGB(130, 130, 130);
+    if (d >= 30) return RGB(200, 40, 40);
+    if (d >= 14) return RGB(190, 120, 0);
+    return RGB(30, 120, 50);
+}
+// Ligne de "petits details" affichee sous le nom du mod dans sa carte.
+static std::wstring BuildDetailsLine(const Mod& m) {
+    std::wstring s;
+    if (!m.cat.empty()) s += m.cat + L"  |  ";
+    s += L"Verif : " + (m.last.empty() ? std::wstring(L"jamais") : DaysText(m.last));
+    s += L"  |  DLL : " + DllStatusText(m, NULL);
+    s += L"  |  TS : " + TsStatusText(m, NULL);
+    return s;
+}
+
 // ---------------------------------------------------------------- liste mods
+// Vue en "cartes" (pas un tableau) : chaque mod est une ligne haute avec une
+// icone visible, le nom, une ligne de petits details, une ligne de note, et
+// ses propres boutons d'action - pas de toolbar partagee, pas de selection
+// au sens ListView. Le panneau (g_hCardsHost, classe "ValModsCards") gere
+// son propre defilement vertical (voir CardsHostProc plus bas).
+static const int CARD_H = 106;
+
+static void ClearCards() {
+    for (size_t i = 0; i < g_cardChildren.size(); ++i)
+        if (g_cardChildren[i].hwnd) DestroyWindow(g_cardChildren[i].hwnd);
+    g_cardChildren.clear();
+}
+// STATIC de carte : SS_NOPREFIX est important ici (pas dans MkLabel, qui
+// n'affiche que du texte fixe ecrit par nous) car le nom/la note d'un mod
+// viennent de l'utilisateur ou de Thunderstore et peuvent contenir '&', que
+// Windows interpreterait sinon comme un prefixe d'acceleration clavier.
+static HWND MkCardStatic(const std::wstring& txt, int x, int y, int w, int h,
+                         HFONT font, COLORREF color, DWORD extraStyle, bool stretch)
+{
+    HWND s = CreateWindowExW(0, L"STATIC", txt.c_str(),
+        WS_CHILD | WS_VISIBLE | SS_NOPREFIX | extraStyle,
+        x, y, w, h, g_hCardsHost, NULL, g_hInst, NULL);
+    SendMessageW(s, WM_SETFONT, (WPARAM)font, TRUE);
+    if (color) SetWindowLongPtrW(s, GWLP_USERDATA, (LONG_PTR)color);
+    CardChild cc; cc.hwnd = s; cc.x = x; cc.y = y; cc.w = w; cc.h = h; cc.stretch = stretch;
+    g_cardChildren.push_back(cc);
+    return s;
+}
+static HWND MkCardButton(int id, const wchar_t* txt, int x, int y, int w, int h) {
+    HWND b = CreateWindowExW(0, L"BUTTON", txt,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        x, y, w, h, g_hCardsHost, (HMENU)(INT_PTR)id, g_hInst, NULL);
+    SendMessageW(b, WM_SETFONT, (WPARAM)g_font, TRUE);
+    CardChild cc; cc.hwnd = b; cc.x = x; cc.y = y; cc.w = w; cc.h = h; cc.stretch = false;
+    g_cardChildren.push_back(cc);
+    return b;
+}
+// Recalcule la largeur des controles "stretch" selon la largeur actuelle du
+// panneau, et repositionne tout selon g_scrollPos. Appelee au defilement ET
+// au redimensionnement (bien moins couteux que reconstruire les cartes).
+static void RepositionCards() {
+    if (!g_hCardsHost) return;
+    RECT rc; GetClientRect(g_hCardsHost, &rc);
+    int hostW = rc.right;
+    for (size_t i = 0; i < g_cardChildren.size(); ++i) {
+        CardChild& cc = g_cardChildren[i];
+        int w = cc.w;
+        if (cc.stretch) {
+            w = hostW - cc.x - 10;
+            if (w < 40) w = 40;
+        }
+        MoveWindow(cc.hwnd, cc.x, cc.y - g_scrollPos, w, cc.h, TRUE);
+    }
+}
+static void UpdateCardsScrollInfo() {
+    if (!g_hCardsHost) return;
+    RECT rc; GetClientRect(g_hCardsHost, &rc);
+    int pageH = rc.bottom - rc.top;
+    SCROLLINFO si; memset(&si, 0, sizeof(si));
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    si.nMin = 0;
+    si.nMax = (g_cardTotalHeight > 0) ? g_cardTotalHeight - 1 : 0;
+    si.nPage = (UINT)((pageH > 1) ? pageH : 1);
+    si.nPos = g_scrollPos;
+    SetScrollInfo(g_hCardsHost, SB_VERT, &si, TRUE);
+    // relit la position potentiellement replafonnee par Windows (page > range)
+    GetScrollInfo(g_hCardsHost, SB_VERT, &si);
+    g_scrollPos = si.nPos;
+}
+
 static void RefillMods() {
     std::stable_sort(g_mods.begin(), g_mods.end(), ModLess);
-    SendMessageW(g_hMods, WM_SETREDRAW, FALSE, 0);
-    ListView_DeleteAllItems(g_hMods);
+    if (g_hCardsHost) SendMessageW(g_hCardsHost, WM_SETREDRAW, FALSE, 0);
+    ClearCards();
+
+    const int iconX = 10, textX = 60;
     for (size_t i = 0; i < g_mods.size(); ++i) {
-        LVITEMW it; memset(&it, 0, sizeof(it));
-        it.mask = LVIF_TEXT | LVIF_PARAM | LVIF_IMAGE;
-        it.iItem = (int)i;
-        it.iImage = GetOrLoadIcon(g_mods[i].iconPath);
-        it.pszText = (LPWSTR)g_mods[i].name.c_str();
-        it.lParam = (LPARAM)i;
-        ListView_InsertItem(g_hMods, &it);
-        ListView_SetItemText(g_hMods, (int)i, COL_CAT, (LPWSTR)g_mods[i].cat.c_str());
-        std::wstring last = g_mods[i].last.empty() ? L"jamais" : g_mods[i].last;
-        ListView_SetItemText(g_hMods, (int)i, COL_LASTCHECK, (LPWSTR)last.c_str());
-        std::wstring dt = DaysText(g_mods[i].last);
-        ListView_SetItemText(g_hMods, (int)i, COL_AGE, (LPWSTR)dt.c_str());
-        std::wstring dllTxt = DllStatusText(g_mods[i], NULL);
-        ListView_SetItemText(g_hMods, (int)i, COL_DLL, (LPWSTR)dllTxt.c_str());
-        std::wstring tsTxt = TsStatusText(g_mods[i], NULL);
-        ListView_SetItemText(g_hMods, (int)i, COL_TSVER, (LPWSTR)tsTxt.c_str());
-        ListView_SetItemText(g_hMods, (int)i, COL_URL, (LPWSTR)g_mods[i].url.c_str());
-        ListView_SetItemText(g_hMods, (int)i, COL_NOTE, (LPWSTR)g_mods[i].note.c_str());
+        const Mod& m = g_mods[i];
+        int y = (int)i * CARD_H;
+
+        HWND icon = CreateWindowExW(0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_ICON | SS_CENTERIMAGE,
+            iconX, y + 12, 40, 40, g_hCardsHost, NULL, g_hInst, NULL);
+        SendMessageW(icon, STM_SETICON, (WPARAM)GetOrLoadHIcon(m.iconPath), 0);
+        { CardChild cc; cc.hwnd = icon; cc.x = iconX; cc.y = y + 12; cc.w = 40; cc.h = 40;
+          cc.stretch = false; g_cardChildren.push_back(cc); }
+
+        MkCardStatic(m.name, textX, y + 8, 400, 20,
+            g_fontBold, 0, SS_LEFTNOWORDWRAP | SS_END_ELLIPSIS, true);
+
+        MkCardStatic(BuildDetailsLine(m), textX, y + 30, 400, 18,
+            g_font, RowStatusColor(m), SS_LEFTNOWORDWRAP | SS_END_ELLIPSIS, true);
+
+        std::wstring noteTxt = m.note.empty() ? L"" : (L"Note : " + m.note);
+        MkCardStatic(noteTxt, textX, y + 50, 400, 18,
+            g_font, RGB(120, 120, 120), SS_LEFTNOWORDWRAP | SS_END_ELLIPSIS, true);
+
+        int bx = textX, by = y + 72, bh = 24, gap = 4;
+        int id = RA_BASE + (int)i * RA_COUNT;
+        HWND bWatch = MkCardButton(id + RA_WATCH, L"Watch",  bx, by, 52, bh); bx += 52 + gap;
+        HWND bHist  = MkCardButton(id + RA_HIST,  L"Hist.",  bx, by, 44, bh); bx += 44 + gap;
+        HWND bCheck = MkCardButton(id + RA_CHECK, L"Check+", bx, by, 54, bh); bx += 54 + gap;
+        HWND bMark  = MkCardButton(id + RA_MARK,  L"OK",     bx, by, 36, bh); bx += 36 + gap;
+        HWND bTs    = MkCardButton(id + RA_TS,    L"TS",     bx, by, 34, bh); bx += 34 + gap;
+        HWND bDl    = MkCardButton(id + RA_DL,    L"DL",     bx, by, 34, bh); bx += 34 + gap;
+        HWND bEdit  = MkCardButton(id + RA_EDIT,  L"Modif.", bx, by, 50, bh); bx += 50 + gap;
+        HWND bMore  = MkCardButton(id + RA_MORE,  L"...",    bx, by, 30, bh); bx += 30 + gap;
+
+        AddTip(bWatch, L"Ouvre la page du mod dans le navigateur");
+        AddTip(bHist,  L"Ouvre la page d'historique / changelog du mod");
+        AddTip(bCheck, L"Ouvre la page du mod ET note la date de verification du jour");
+        AddTip(bMark,  L"Note la date de verification SANS ouvrir de lien - deja verifie ailleurs ?");
+        AddTip(bTs,    L"Interroge Thunderstore pour connaitre la derniere version publiee");
+        AddTip(bDl,    L"Telecharge le zip de la derniere version (demande ou l'enregistrer)");
+        AddTip(bEdit,  L"Modifie ce mod");
+        AddTip(bMore,  L"Plus d'actions : copier le lien, localiser le DLL, supprimer...");
+
+        MkCardStatic(L"", 8, y + CARD_H - 6, 400, 2, g_font, 0, SS_ETCHEDHORZ, true);
     }
-    SendMessageW(g_hMods, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(g_hMods, NULL, TRUE);
-}
-static int SelectedMod() { return ListView_GetNextItem(g_hMods, -1, LVNI_SELECTED); }
-static void SelectMod(int i) {
-    if (i < 0 || i >= (int)g_mods.size()) return;
-    ListView_SetItemState(g_hMods, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-    ListView_EnsureVisible(g_hMods, i, FALSE);
+
+    g_cardTotalHeight = (int)g_mods.size() * CARD_H;
+    UpdateCardsScrollInfo();
+    RepositionCards();
+
+    if (g_hCardsHost) {
+        SendMessageW(g_hCardsHost, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(g_hCardsHost, NULL, TRUE);
+    }
 }
 
 // ---------------------------------------------------------------- editeur mod
@@ -1090,6 +1215,30 @@ static std::wstring BrowseFile(HWND owner, const wchar_t* filter,
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
     if (GetOpenFileNameW(&ofn)) return std::wstring(buf);
     return current;
+}
+// Boite "Enregistrer sous..." (contrairement a BrowseFile, annuler renvoie
+// une chaine vide plutot qu'une valeur "actuelle" - il n'y en a pas ici).
+static std::wstring BrowseSaveFile(HWND owner, const wchar_t* filter,
+                                   const std::wstring& initialDir,
+                                   const std::wstring& suggestedName, const wchar_t* title)
+{
+    wchar_t buf[MAX_PATH]; buf[0] = 0;
+    if (!suggestedName.empty()) {
+        wcsncpy(buf, suggestedName.c_str(), MAX_PATH - 1);
+        buf[MAX_PATH - 1] = 0;
+    }
+    OPENFILENAMEW ofn; memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = buf;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = title;
+    ofn.lpstrInitialDir = (!initialDir.empty() && DirExists(initialDir)) ? initialDir.c_str() : NULL;
+    ofn.lpstrDefExt = L"zip";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (GetSaveFileNameW(&ofn)) return std::wstring(buf);
+    return L"";
 }
 static void UpdateIconPreview(EditCtx* c, const std::wstring& path) {
     if (!c || !c->hIconPreview) return;
@@ -1383,30 +1532,30 @@ static void BackupSelection(HWND hwnd) {
 }
 
 // ---------------------------------------------------------------- actions mod
-static void ActionOpen(HWND hwnd, bool stamp) {
-    int i = SelectedMod();
-    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
-    std::wstring url = g_mods[i].url;
-    std::wstring name = g_mods[i].name;
+// Chaque action prend l'index du mod concerne EXPLICITEMENT (idx), passe par
+// le bouton de la carte qui l'a declenchee - il n'y a plus de "selection"
+// au sens ListView depuis le passage a la vue en cartes.
+static bool ValidMod(HWND hwnd, int idx) {
+    if (idx >= 0 && idx < (int)g_mods.size()) return true;
+    Info(hwnd, L"Ce mod n'est plus dans la liste (elle a change entre-temps).");
+    return false;
+}
+static void ActionOpen(HWND hwnd, int idx, bool stamp) {
+    if (!ValidMod(hwnd, idx)) return;
+    std::wstring url = g_mods[idx].url;
     if (url.empty()) { Info(hwnd, L"Ce mod n'a pas de lien."); return; }
     ShellExecuteW(NULL, L"open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
     if (stamp) {
-        g_mods[i].last = NowStamp();
+        g_mods[idx].last = NowStamp();
         SaveMods();
         RefillMods();
-        for (size_t k = 0; k < g_mods.size(); ++k)
-            if (g_mods[k].name == name) { SelectMod((int)k); break; }
     }
 }
-static void ActionMark(HWND hwnd) {
-    int i = SelectedMod();
-    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
-    std::wstring name = g_mods[i].name;
-    g_mods[i].last = NowStamp();
+static void ActionMark(HWND hwnd, int idx) {
+    if (!ValidMod(hwnd, idx)) return;
+    g_mods[idx].last = NowStamp();
     SaveMods();
     RefillMods();
-    for (size_t k = 0; k < g_mods.size(); ++k)
-        if (g_mods[k].name == name) { SelectMod((int)k); break; }
 }
 static void ActionAdd(HWND hwnd) {
     Mod m;
@@ -1416,53 +1565,44 @@ static void ActionAdd(HWND hwnd) {
         g_mods.push_back(m);
         SaveMods();
         RefillMods();
-        for (size_t k = 0; k < g_mods.size(); ++k)
-            if (g_mods[k].name == m.name) { SelectMod((int)k); break; }
     }
 }
-static void ActionEdit(HWND hwnd) {
-    int i = SelectedMod();
-    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
-    Mod m = g_mods[i];
+static void ActionEdit(HWND hwnd, int idx) {
+    if (!ValidMod(hwnd, idx)) return;
+    Mod m = g_mods[idx];
     if (ShowModEditor(hwnd, L"Modifier le mod", m)) {
-        g_mods[i] = m;
+        g_mods[idx] = m;
         SaveMods();
         RefillMods();
-        for (size_t k = 0; k < g_mods.size(); ++k)
-            if (g_mods[k].name == m.name) { SelectMod((int)k); break; }
     }
 }
-static void ActionDelete(HWND hwnd) {
-    int i = SelectedMod();
-    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
-    std::wstring q = L"Supprimer \"" + g_mods[i].name + L"\" de la liste ?\n"
+static void ActionDelete(HWND hwnd, int idx) {
+    if (!ValidMod(hwnd, idx)) return;
+    std::wstring q = L"Supprimer \"" + g_mods[idx].name + L"\" de la liste ?\n"
                      L"(le mod n'est pas desinstalle, seule la fiche est supprimee)";
     if (MessageBoxW(hwnd, q.c_str(), L"ValMods", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
-    g_mods.erase(g_mods.begin() + i);
+    g_mods.erase(g_mods.begin() + idx);
     SaveMods();
     RefillMods();
 }
-static void ActionCopy(HWND hwnd) {
-    int i = SelectedMod();
-    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
-    CopyToClipboard(hwnd, g_mods[i].url);
+static void ActionCopy(HWND hwnd, int idx) {
+    if (!ValidMod(hwnd, idx)) return;
+    CopyToClipboard(hwnd, g_mods[idx].url);
 }
-static void ActionOpenHistory(HWND hwnd) {
-    int i = SelectedMod();
-    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
-    if (g_mods[i].changelogUrl.empty()) {
+static void ActionOpenHistory(HWND hwnd, int idx) {
+    if (!ValidMod(hwnd, idx)) return;
+    if (g_mods[idx].changelogUrl.empty()) {
         Info(hwnd, L"Ce mod n'a pas de lien vers son historique des versions.\n"
-                   L"Ajoute-le en modifiant le mod (bouton Modifier).");
+                   L"Ajoute-le en modifiant le mod (bouton Modif.).");
         return;
     }
-    ShellExecuteW(NULL, L"open", g_mods[i].changelogUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+    ShellExecuteW(NULL, L"open", g_mods[idx].changelogUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
 }
-static void ActionLocateDll(HWND hwnd) {
-    int i = SelectedMod();
-    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
-    const std::wstring& p = g_mods[i].dllPath;
+static void ActionLocateDll(HWND hwnd, int idx) {
+    if (!ValidMod(hwnd, idx)) return;
+    const std::wstring& p = g_mods[idx].dllPath;
     if (p.empty()) {
-        Info(hwnd, L"Aucun DLL associe a ce mod.\nAssocie-le en modifiant le mod (bouton Modifier).");
+        Info(hwnd, L"Aucun DLL associe a ce mod.\nAssocie-le en modifiant le mod (bouton Modif.).");
         return;
     }
     if (!FileExists(p)) {
@@ -1472,23 +1612,34 @@ static void ActionLocateDll(HWND hwnd) {
     }
     RevealFile(p);
 }
-static void ActionOpenDllDir(HWND hwnd) {
-    int i = SelectedMod();
-    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
-    const std::wstring& p = g_mods[i].dllPath;
+static void ActionOpenDllDir(HWND hwnd, int idx) {
+    if (!ValidMod(hwnd, idx)) return;
+    const std::wstring& p = g_mods[idx].dllPath;
     if (p.empty()) {
-        Info(hwnd, L"Aucun DLL associe a ce mod.\nAssocie-le en modifiant le mod (bouton Modifier).");
+        Info(hwnd, L"Aucun DLL associe a ce mod.\nAssocie-le en modifiant le mod (bouton Modif.).");
         return;
     }
     size_t s = p.find_last_of(L"\\/");
     std::wstring dir = (s == std::wstring::npos) ? PluginsDir() : p.substr(0, s);
     OpenFolder(hwnd, dir, L"dossier du DLL");
 }
-static void ActionCheckThunderstore(HWND hwnd) {
-    int i = SelectedMod();
-    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
-    std::wstring name = g_mods[i].name;
-    std::wstring url = g_mods[i].url;
+static void ShowRowOverflowMenu(HWND hwnd, int idx) {
+    if (!ValidMod(hwnd, idx)) return;
+    g_ctxMenuModIndex = idx;
+    POINT pt; GetCursorPos(&pt);
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, IDM_CTX_COPY,        L"Copier le lien");
+    AppendMenuW(m, MF_STRING, IDM_CTX_LOCATE_DLL,  L"Localiser le DLL dans l'explorateur");
+    AppendMenuW(m, MF_STRING, IDM_CTX_OPEN_DLLDIR, L"Ouvrir le dossier du DLL");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_CTX_DELETE,      L"Supprimer");
+    TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(m);
+}
+static void ActionCheckThunderstore(HWND hwnd, int idx) {
+    if (!ValidMod(hwnd, idx)) return;
+    std::wstring name = g_mods[idx].name;
+    std::wstring url = g_mods[idx].url;
 
     HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
     TsCheckResult r = CheckThunderstoreVersion(url);
@@ -1514,7 +1665,6 @@ static void ActionCheckThunderstore(HWND hwnd) {
             g_mods[k].last = NowStamp();   // une verification en ligne compte comme une verification
             SaveMods();
             RefillMods();
-            SelectMod((int)k);
             break;
         }
     }
@@ -1525,11 +1675,10 @@ static void ActionCheckThunderstore(HWND hwnd) {
               L"par son auteur sur Thunderstore.";
     Info(hwnd, msg.c_str());
 }
-static void ActionDownloadLatest(HWND hwnd) {
-    int i = SelectedMod();
-    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
-    std::wstring name = g_mods[i].name;
-    std::wstring url = g_mods[i].url;
+static void ActionDownloadLatest(HWND hwnd, int idx) {
+    if (!ValidMod(hwnd, idx)) return;
+    std::wstring name = g_mods[idx].name;
+    std::wstring url = g_mods[idx].url;
 
     std::wstring ns, pkgName;
     if (!ParseThunderstoreUrl(url, ns, pkgName)) {
@@ -1539,14 +1688,13 @@ static void ActionDownloadLatest(HWND hwnd) {
         return;
     }
 
-    HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
-
-    std::wstring version = g_mods[i].tsVersion;
+    std::wstring version = g_mods[idx].tsVersion;
     if (version.empty()) {
         // pas encore verifie : on va d'abord chercher la derniere version
+        HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
         TsCheckResult chk = CheckThunderstoreVersion(url);
+        SetCursor(oldCursor);
         if (!chk.ok) {
-            SetCursor(oldCursor);
             std::wstring m = L"Impossible de determiner la derniere version :\n" + chk.error;
             MessageBoxW(hwnd, m.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
             return;
@@ -1554,8 +1702,19 @@ static void ActionDownloadLatest(HWND hwnd) {
         version = chk.latestVersion;
     }
 
-    std::wstring savedPath, err;
-    bool ok = DownloadThunderstoreZip(ns, pkgName, version, savedPath, err);
+    // "Parcourir" pour choisir ou enregistrer le zip - suggestion par defaut
+    // dans downloads/ mais entierement modifiable, comme demande.
+    MakeDirs(DownloadsRoot());
+    std::wstring suggested = SanitizeFileName(ns) + L"-" + SanitizeFileName(pkgName) + L"-" +
+                             SanitizeFileName(version) + L".zip";
+    std::wstring destPath = BrowseSaveFile(hwnd,
+        L"Archive zip (*.zip)\0*.zip\0Tous les fichiers (*.*)\0*.*\0",
+        DownloadsRoot(), suggested, L"Enregistrer le zip du mod sous...");
+    if (destPath.empty()) return;   // annule par l'utilisateur
+
+    HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
+    std::wstring err;
+    bool ok = DownloadThunderstoreZip(ns, pkgName, version, destPath, err);
     SetCursor(oldCursor);
 
     if (!ok) {
@@ -1572,12 +1731,11 @@ static void ActionDownloadLatest(HWND hwnd) {
             g_mods[k].last = NowStamp();
             SaveMods();
             RefillMods();
-            SelectMod((int)k);
             break;
         }
     }
 
-    std::wstring msg = L"Version " + version + L" telechargee :\n" + savedPath +
+    std::wstring msg = L"Version " + version + L" telechargee :\n" + destPath +
         L"\n\nA extraire toi-meme dans BepInEx\\plugins - ValMods ne modifie\n"
         L"jamais tes fichiers de jeu automatiquement.";
     Info(hwnd, msg.c_str());
@@ -1628,19 +1786,17 @@ static void LayoutAll(HWND hwnd) {
     if (pw < 100) pw = 100;
     if (ph < 100) ph = 100;
 
-    // --- onglet mods : deux rangees de boutons + liste
-    const int bw = 104, bh = 28, gap = 6;
-    int row1[4] = { IDC_BADD, IDC_BEDIT, IDC_BDEL, IDC_BCOPY };
-    int row2[6] = { IDC_BWATCH, IDC_BHIST, IDC_BCHECK, IDC_BMARK, IDC_BTSCHECK, IDC_BDOWNLOAD };
-    for (int i = 0; i < 4; ++i) {
-        HWND b1 = GetDlgItem(hwnd, row1[i]);
-        if (b1) MoveWindow(b1, px + i * (bw + gap), py, bw, bh, TRUE);
-    }
-    for (int i = 0; i < 6; ++i) {
-        HWND b2 = GetDlgItem(hwnd, row2[i]);
-        if (b2) MoveWindow(b2, px + i * (bw + gap), py + bh + gap, bw, bh, TRUE);
-    }
-    MoveWindow(g_hMods, px, py + 2 * (bh + gap), pw, ph - 2 * (bh + gap), TRUE);
+    // --- onglet mods : barre (Ajouter + tri) + panneau de cartes scrollable
+    const int bh = 28, gap = 6, topH = bh + 4;
+    HWND badd = GetDlgItem(hwnd, IDC_BADD);
+    if (badd) MoveWindow(badd, px, py, 100, bh, TRUE);
+    HWND combo = GetDlgItem(hwnd, IDC_SORTCOMBO);
+    // la hauteur passee a un CBS_DROPDOWNLIST fixe celle de la liste DEROULEE,
+    // pas celle du controle ferme (determinee par la police) - 200 est large.
+    if (combo) MoveWindow(combo, px + 100 + gap, py, 220, 200, TRUE);
+    HWND dirBtn = GetDlgItem(hwnd, IDC_SORTDIR);
+    if (dirBtn) MoveWindow(dirBtn, px + 100 + gap + 220 + gap, py, 120, bh, TRUE);
+    if (g_hCardsHost) MoveWindow(g_hCardsHost, px, py + topH, pw, ph - topH, TRUE);
 
     // --- onglet sauvegardes
     int lh = (ph - 84) / 2;
@@ -1690,6 +1846,75 @@ static void AddTip(HWND ctrl, const wchar_t* text) {
     ti.uId = (UINT_PTR)ctrl;
     ti.lpszText = (LPWSTR)text;
     SendMessageW(g_hTooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+}
+
+// ---------------------------------------------------------------- panneau cartes
+// Fenetre custom qui heberge les cartes de mods et gere son propre
+// defilement vertical (molette + barre de scroll). RefillMods() cree/detruit
+// les controles enfants ; cette proc ne fait que scroller/redimensionner ce
+// qui existe deja, et transmettre la couleur de texte des controles "status"
+// (voir MkCardStatic : la couleur est stockee dans GWLP_USERDATA de chacun).
+static LRESULT CALLBACK CardsHostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_SIZE:
+        UpdateCardsScrollInfo();
+        RepositionCards();
+        return 0;
+    case WM_VSCROLL: {
+        SCROLLINFO si; memset(&si, 0, sizeof(si));
+        si.cbSize = sizeof(si); si.fMask = SIF_ALL;
+        GetScrollInfo(hwnd, SB_VERT, &si);
+        int pos = si.nPos;
+        switch (LOWORD(wp)) {
+            case SB_LINEUP:   pos -= 30; break;
+            case SB_LINEDOWN: pos += 30; break;
+            case SB_PAGEUP:   pos -= (int)si.nPage; break;
+            case SB_PAGEDOWN: pos += (int)si.nPage; break;
+            case SB_THUMBTRACK: case SB_THUMBPOSITION: pos = si.nTrackPos; break;
+            case SB_TOP:    pos = si.nMin; break;
+            case SB_BOTTOM: pos = si.nMax; break;
+            default: break;
+        }
+        int maxPos = si.nMax - (int)si.nPage + 1; if (maxPos < 0) maxPos = 0;
+        if (pos < 0) pos = 0;
+        if (pos > maxPos) pos = maxPos;
+        g_scrollPos = pos;
+        si.fMask = SIF_POS; si.nPos = pos;
+        SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+        RepositionCards();
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        // GET_WHEEL_DELTA_WPARAM vient de <windowsx.h>, non inclus ici ;
+        // c'est litteralement sa definition : le mot haut de wParam, signe.
+        short delta = (short)HIWORD(wp);
+        int amount = -((int)delta / WHEEL_DELTA) * 60;   // 60px par cran, sens naturel
+        SCROLLINFO si; memset(&si, 0, sizeof(si));
+        si.cbSize = sizeof(si); si.fMask = SIF_ALL;
+        GetScrollInfo(hwnd, SB_VERT, &si);
+        int maxPos = si.nMax - (int)si.nPage + 1; if (maxPos < 0) maxPos = 0;
+        int pos = g_scrollPos + amount;
+        if (pos < 0) pos = 0;
+        if (pos > maxPos) pos = maxPos;
+        g_scrollPos = pos;
+        si.fMask = SIF_POS; si.nPos = pos;
+        SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+        RepositionCards();
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HWND ctrl = (HWND)lp;
+        LONG_PTR cr = GetWindowLongPtrW(ctrl, GWLP_USERDATA);
+        if (cr != 0) {
+            HDC hdc = (HDC)wp;
+            SetTextColor(hdc, (COLORREF)cr);
+            SetBkMode(hdc, TRANSPARENT);
+            return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+        }
+        break;   // pas de couleur assignee (nom du mod, separateur...) : par defaut
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 static void BuildMenu(HWND hwnd) {
@@ -1744,41 +1969,44 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ti.pszText = (LPWSTR)L"Sauvegardes";
         TabCtrl_InsertItem(g_hTab, 1, &ti);
 
-        // page mods
+        // page mods : barre (Ajouter + tri) + panneau de cartes scrollable
         g_nMods = 0;
-        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BADD,   L"Ajouter");
-        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BEDIT,  L"Modifier");
-        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BDEL,   L"Supprimer");
-        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BCOPY,  L"Copier lien");
-        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BWATCH, L"Watch");
-        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BHIST,  L"Historique");
-        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BCHECK, L"Check update");
-        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BMARK,  L"Verifie");
-        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BTSCHECK, L"Verif. TS");
-        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BDOWNLOAD, L"Telecharger");
-        g_hMods = MkList(hwnd, IDC_MODLIST);
-        g_pageMods[g_nMods++] = g_hMods;
-        AddCol(g_hMods, COL_NAME,      L"Mod", 190);
-        AddCol(g_hMods, COL_CAT,       L"Categorie", 110);
-        AddCol(g_hMods, COL_LASTCHECK, L"Derniere verif", 115);
-        AddCol(g_hMods, COL_AGE,       L"Age", 50);
-        AddCol(g_hMods, COL_DLL,       L"DLL", 170);
-        AddCol(g_hMods, COL_TSVER,     L"MAJ (Thunderstore)", 150);
-        AddCol(g_hMods, COL_URL,       L"Lien", 220);
-        AddCol(g_hMods, COL_NOTE,      L"Note", 140);
+        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BADD, L"Ajouter");
 
-        // icone par mod : petite image list 16x16 alimentee a la volee
-        // (voir GetOrLoadIcon) via GDI+, avec une icone grise par defaut.
-        g_imgList = ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, 8, 32);
-        if (g_imgList) {
-            HICON def = MakeDefaultIcon(16);
-            g_defaultIconIdx = def ? ImageList_AddIcon(g_imgList, def) : -1;
-            if (def) DestroyIcon(def);
-            ListView_SetImageList(g_hMods, g_imgList, LVSIL_SMALL);
-        }
+        HWND combo = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+            0, 0, 10, 200, hwnd, (HMENU)IDC_SORTCOMBO, g_hInst, NULL);
+        SendMessageW(combo, WM_SETFONT, (WPARAM)g_font, TRUE);
+        const wchar_t* sortLabels[] = { L"Nom", L"Categorie", L"Derniere verification",
+                                        L"DLL", L"MAJ Thunderstore", L"Lien", L"Note" };
+        for (int si = 0; si < 7; ++si) SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)sortLabels[si]);
+        SendMessageW(combo, CB_SETCURSEL, 0, 0);
+        g_pageMods[g_nMods++] = combo;
 
-        // info-bulles sur les boutons : repond a "a quoi sert ce bouton ?"
-        // directement dans l'interface plutot que dans une doc a part.
+        HWND dirBtn = MkButton(hwnd, IDC_SORTDIR, L"^ Croissant");
+        g_pageMods[g_nMods++] = dirBtn;
+
+        WNDCLASSEXW cwc; memset(&cwc, 0, sizeof(cwc));
+        cwc.cbSize = sizeof(cwc);
+        cwc.lpfnWndProc = CardsHostProc;
+        cwc.hInstance = g_hInst;
+        cwc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        cwc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        cwc.lpszClassName = L"ValModsCards";
+        RegisterClassExW(&cwc);
+        g_hCardsHost = CreateWindowExW(WS_EX_CLIENTEDGE, L"ValModsCards", L"",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_CLIPCHILDREN,
+            0, 0, 10, 10, hwnd, NULL, g_hInst, NULL);
+        g_pageMods[g_nMods++] = g_hCardsHost;
+
+        // icone par defaut (mods sans logo choisi) : chargee une seule fois,
+        // reutilisee par toutes les cartes qui n'ont pas d'iconPath valide.
+        g_defaultIcon = MakeDefaultIcon(40);
+
+        // info-bulles : repond a "a quoi sert ce bouton ?" directement dans
+        // l'interface. Celles des boutons de chaque carte sont ajoutees a
+        // la volee dans RefillMods (elles n'existent qu'apres la creation
+        // des cartes correspondantes).
         g_hTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL,
             WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
             CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -1786,22 +2014,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_hTooltip) {
             SetWindowPos(g_hTooltip, HWND_TOPMOST, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            AddTip(GetDlgItem(hwnd, IDC_BADD),   L"Ajoute un nouveau mod a la liste");
-            AddTip(GetDlgItem(hwnd, IDC_BEDIT),  L"Modifie le mod selectionne");
-            AddTip(GetDlgItem(hwnd, IDC_BDEL),   L"Retire la fiche du mod (ne desinstalle rien)");
-            AddTip(GetDlgItem(hwnd, IDC_BCOPY),  L"Copie le lien du mod dans le presse-papier");
-            AddTip(GetDlgItem(hwnd, IDC_BWATCH), L"Ouvre la page du mod dans le navigateur");
-            AddTip(GetDlgItem(hwnd, IDC_BHIST),  L"Ouvre la page d'historique / changelog du mod");
-            AddTip(GetDlgItem(hwnd, IDC_BCHECK), L"Ouvre la page du mod ET note la date de verification du jour");
-            AddTip(GetDlgItem(hwnd, IDC_BMARK),
-                L"Note la date de verification SANS ouvrir de lien - utile si tu as deja "
-                L"verifie ailleurs (Discord du mod, changelog deja ouvert dans un autre onglet...)");
-            AddTip(GetDlgItem(hwnd, IDC_BTSCHECK),
-                L"Interroge l'API publique de Thunderstore pour connaitre la derniere "
-                L"version publiee (uniquement pour les mods heberges sur thunderstore.io)");
-            AddTip(GetDlgItem(hwnd, IDC_BDOWNLOAD),
-                L"Telecharge le zip de la derniere version dans downloads\\ - a extraire "
-                L"toi-meme dans BepInEx\\plugins (Thunderstore uniquement, rien n'est installe automatiquement)");
+            AddTip(GetDlgItem(hwnd, IDC_BADD), L"Ajoute un nouveau mod a la liste");
+            AddTip(combo,  L"Choisit le critere de tri de la liste");
+            AddTip(dirBtn, L"Inverse l'ordre de tri (croissant / decroissant)");
         }
 
 
@@ -1845,35 +2060,54 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mm = (MINMAXINFO*)lp;
-        mm->ptMinTrackSize.x = 820;
+        // 900 : marge confortable pour les 8 boutons de chaque carte de mod.
+        mm->ptMinTrackSize.x = 900;
         mm->ptMinTrackSize.y = 480;
         return 0;
     }
 
-    case WM_COMMAND:
-        switch (LOWORD(wp)) {
-        case IDC_BADD:   ActionAdd(hwnd);          return 0;
-        case IDC_BEDIT:  ActionEdit(hwnd);         return 0;
-        case IDC_BDEL:   ActionDelete(hwnd);       return 0;
-        case IDC_BWATCH: ActionOpen(hwnd, false);  return 0;
-        case IDC_BHIST:  ActionOpenHistory(hwnd);  return 0;
-        case IDC_BCHECK: ActionOpen(hwnd, true);   return 0;
-        case IDC_BMARK:  ActionMark(hwnd);         return 0;
-        case IDC_BCOPY:  ActionCopy(hwnd);         return 0;
-        case IDC_BTSCHECK: ActionCheckThunderstore(hwnd); return 0;
-        case IDC_BDOWNLOAD: ActionDownloadLatest(hwnd); return 0;
+    case WM_COMMAND: {
+        int cid = LOWORD(wp);
 
-        case IDM_CTX_WATCH:       ActionOpen(hwnd, false); return 0;
-        case IDM_CTX_HIST:        ActionOpenHistory(hwnd); return 0;
-        case IDM_CTX_CHECK:       ActionOpen(hwnd, true);  return 0;
-        case IDM_CTX_MARK:        ActionMark(hwnd);        return 0;
-        case IDM_CTX_TSCHECK:     ActionCheckThunderstore(hwnd); return 0;
-        case IDM_CTX_DOWNLOAD:    ActionDownloadLatest(hwnd);    return 0;
-        case IDM_CTX_LOCATE_DLL:  ActionLocateDll(hwnd);   return 0;
-        case IDM_CTX_OPEN_DLLDIR: ActionOpenDllDir(hwnd);  return 0;
-        case IDM_CTX_COPY:        ActionCopy(hwnd);        return 0;
-        case IDM_CTX_EDIT:        ActionEdit(hwnd);        return 0;
-        case IDM_CTX_DELETE:      ActionDelete(hwnd);      return 0;
+        // boutons dynamiques d'une carte de mod (voir RA_BASE/RA_COUNT) :
+        // id = RA_BASE + index_ligne * RA_COUNT + action.
+        if (cid >= RA_BASE) {
+            int raw = cid - RA_BASE;
+            int action = raw % RA_COUNT;
+            int rowIdx = raw / RA_COUNT;
+            switch (action) {
+                case RA_WATCH: ActionOpen(hwnd, rowIdx, false);        break;
+                case RA_HIST:  ActionOpenHistory(hwnd, rowIdx);        break;
+                case RA_CHECK: ActionOpen(hwnd, rowIdx, true);         break;
+                case RA_MARK:  ActionMark(hwnd, rowIdx);               break;
+                case RA_TS:    ActionCheckThunderstore(hwnd, rowIdx);  break;
+                case RA_DL:    ActionDownloadLatest(hwnd, rowIdx);     break;
+                case RA_EDIT:  ActionEdit(hwnd, rowIdx);               break;
+                case RA_MORE:  ShowRowOverflowMenu(hwnd, rowIdx);      break;
+            }
+            return 0;
+        }
+        if (cid == IDC_SORTCOMBO && HIWORD(wp) == CBN_SELCHANGE) {
+            int sel = (int)SendMessageW(GetDlgItem(hwnd, IDC_SORTCOMBO), CB_GETCURSEL, 0, 0);
+            static const int SORT_MAP[] = { COL_NAME, COL_CAT, COL_LASTCHECK, COL_DLL,
+                                            COL_TSVER, COL_URL, COL_NOTE };
+            if (sel >= 0 && sel < 7) { g_sortCol = SORT_MAP[sel]; RefillMods(); }
+            return 0;
+        }
+
+        switch (cid) {
+        case IDC_BADD: ActionAdd(hwnd); return 0;
+        case IDC_SORTDIR:
+            g_sortAsc = !g_sortAsc;
+            SetWindowTextW(GetDlgItem(hwnd, IDC_SORTDIR), g_sortAsc ? L"^ Croissant" : L"v Decroissant");
+            RefillMods();
+            return 0;
+
+        // menu "..." d'une carte (actions moins frequentes)
+        case IDM_CTX_LOCATE_DLL:  ActionLocateDll(hwnd, g_ctxMenuModIndex);   return 0;
+        case IDM_CTX_OPEN_DLLDIR: ActionOpenDllDir(hwnd, g_ctxMenuModIndex);  return 0;
+        case IDM_CTX_COPY:        ActionCopy(hwnd, g_ctxMenuModIndex);       return 0;
+        case IDM_CTX_DELETE:      ActionDelete(hwnd, g_ctxMenuModIndex);     return 0;
 
         case IDC_BREFRESH:  RefreshSaves(); return 0;
         case IDC_BOPENSAVE: OpenFolder(hwnd, SavesRoot(), L"sauvegardes"); return 0;
@@ -1895,114 +2129,45 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::wstring about =
                 L"ValMods " + U2W(VALMODS_VERSION) + L" - gestionnaire manuel de mods Valheim\n\n";
             about +=
+                L"Chaque mod est une carte avec ses propres boutons :\n"
                 L"Watch          : ouvre la page du mod\n"
-                L"Historique     : ouvre la page des changements / versions\n"
-                L"Check update   : ouvre la page du mod ET note la date de verification\n"
-                L"Verifie        : note la date de verification SANS ouvrir de lien\n"
+                L"Hist.          : ouvre la page des changements / versions\n"
+                L"Check+         : ouvre la page du mod ET note la date de verification\n"
+                L"OK             : note la date de verification SANS ouvrir de lien\n"
                 L"                 (utile si tu as deja verifie ailleurs : Discord du\n"
-                L"                 mod, changelog deja ouvert dans un autre onglet...)\n\n"
-                L"Double-clic sur un mod : ouvre son lien\n"
-                L"Clic droit sur un mod  : menu avec toutes les actions, y compris le DLL\n"
-                L"Clic sur un en-tete de colonne : tri\n\n"
-                L"La colonne DLL indique si le fichier associe au mod est present (vert),\n"
-                L"manquant (rouge) ou non renseigne (gris).\n\n"
+                L"                 mod, changelog deja ouvert dans un autre onglet...)\n"
+                L"TS             : verifie la derniere version sur Thunderstore\n"
+                L"DL             : telecharge le zip (demande ou l'enregistrer)\n"
+                L"Modif.         : modifie le mod\n"
+                L"...            : copier le lien, localiser le DLL, ouvrir son\n"
+                L"                 dossier, supprimer\n\n"
+                L"Le menu deroulant en haut choisit le critere de tri, le bouton a\n"
+                L"cote inverse l'ordre (croissant / decroissant).\n\n"
+                L"La ligne de details (categorie / verif / DLL / TS) est coloree :\n"
+                L"rouge = probleme (DLL manquant ou mise a jour disponible),\n"
+                L"orange = verification ancienne (14+ jours), vert = tout va bien,\n"
+                L"gris = jamais verifie.\n\n"
                 L"Verif. TS interroge l'API publique de Thunderstore pour connaitre la\n"
                 L"derniere version publiee (uniquement pour les mods heberges sur\n"
-                L"thunderstore.io - Nexus/GitHub ne sont pas geres). La colonne MAJ\n"
-                L"compare cette version a celle du DLL installe : vert = a jour,\n"
-                L"rouge = mise a jour disponible, gris = pas encore verifie / inconnu.\n\n"
+                L"thunderstore.io - Nexus/GitHub ne sont pas geres).\n\n"
                 L"Dans l'editeur, Auto-remplir depuis Thunderstore recupere le nom, la\n"
                 L"categorie, le lien historique, la derniere version et l'icone du mod\n"
                 L"a partir du lien colle (meme limite : Thunderstore uniquement).\n\n"
-                L"Telecharger recupere le zip de la derniere version dans downloads\\ -\n"
-                L"a extraire toi-meme dans BepInEx\\plugins, rien n'est installe\n"
-                L"automatiquement.\n\n"
-                L"Les mods non verifies depuis plus de 30 jours sont en rouge,\n"
-                L"ceux jamais verifies en gris.\n\n"
+                L"Telecharger (DL) propose une boite Enregistrer sous - a extraire\n"
+                L"toi-meme dans BepInEx\\plugins, rien n'est installe automatiquement.\n\n"
                 L"Donnees : valmods.json, a cote de l'exe.";
             Info(hwnd, about.c_str());
             return 0;
         }
         }
         break;
+    }
 
     case WM_NOTIFY: {
         NMHDR* nh = (NMHDR*)lp;
         if (nh->hwndFrom == g_hTab && nh->code == TCN_SELCHANGE) {
             ShowPage(TabCtrl_GetCurSel(g_hTab));
             return 0;
-        }
-        if (nh->hwndFrom == g_hMods) {
-            if (nh->code == NM_DBLCLK) { ActionOpen(hwnd, false); return 0; }
-            if (nh->code == LVN_COLUMNCLICK) {
-                NMLISTVIEW* nv = (NMLISTVIEW*)lp;
-                if (nv->iSubItem == g_sortCol) g_sortAsc = !g_sortAsc;
-                else { g_sortCol = nv->iSubItem; g_sortAsc = true; }
-                RefillMods();
-                return 0;
-            }
-            if (nh->code == NM_RCLICK) {
-                LPNMITEMACTIVATE ia = (LPNMITEMACTIVATE)lp;
-                if (ia->iItem >= 0) SelectMod(ia->iItem);
-                if (SelectedMod() >= 0) {
-                    POINT pt; GetCursorPos(&pt);
-                    HMENU m = CreatePopupMenu();
-                    AppendMenuW(m, MF_STRING, IDM_CTX_WATCH,       L"Ouvrir le lien (Watch)");
-                    AppendMenuW(m, MF_STRING, IDM_CTX_HIST,        L"Ouvrir l'historique des versions");
-                    AppendMenuW(m, MF_STRING, IDM_CTX_CHECK,       L"Ouvrir le lien + noter la verification");
-                    AppendMenuW(m, MF_STRING, IDM_CTX_MARK,        L"Noter la verification (sans ouvrir)");
-                    AppendMenuW(m, MF_STRING, IDM_CTX_TSCHECK,     L"Verifier la derniere version (Thunderstore)");
-                    AppendMenuW(m, MF_STRING, IDM_CTX_DOWNLOAD,    L"Telecharger la derniere version (.zip)");
-                    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-                    AppendMenuW(m, MF_STRING, IDM_CTX_LOCATE_DLL,  L"Localiser le DLL dans l'explorateur");
-                    AppendMenuW(m, MF_STRING, IDM_CTX_OPEN_DLLDIR, L"Ouvrir le dossier du DLL");
-                    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-                    AppendMenuW(m, MF_STRING, IDM_CTX_COPY,        L"Copier le lien");
-                    AppendMenuW(m, MF_STRING, IDM_CTX_EDIT,        L"Modifier...");
-                    AppendMenuW(m, MF_STRING, IDM_CTX_DELETE,      L"Supprimer");
-                    TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
-                    DestroyMenu(m);
-                }
-                return 0;
-            }
-            if (nh->code == NM_CUSTOMDRAW) {
-                LPNMLVCUSTOMDRAW cd = (LPNMLVCUSTOMDRAW)lp;
-                if (cd->nmcd.dwDrawStage == CDDS_PREPAINT)
-                    return CDRF_NOTIFYITEMDRAW;
-                if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
-                    size_t idx = (size_t)cd->nmcd.lItemlParam;
-                    if (idx < g_mods.size()) {
-                        int d = DaysSince(g_mods[idx].last);
-                        if (d < 0)        cd->clrText = RGB(130, 130, 130);
-                        else if (d >= 30) cd->clrText = RGB(200, 40, 40);
-                        else if (d >= 14) cd->clrText = RGB(190, 120, 0);
-                    }
-                    // on redemande un passage par sous-element pour pouvoir
-                    // surcharger juste la couleur de la colonne DLL en dessous.
-                    return CDRF_NOTIFYSUBITEMDRAW;
-                }
-                if (cd->nmcd.dwDrawStage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM)) {
-                    size_t idx = (size_t)cd->nmcd.lItemlParam;
-                    if (cd->iSubItem == COL_DLL) {
-                        if (idx < g_mods.size()) {
-                            bool missing = false;
-                            DllStatusText(g_mods[idx], &missing);
-                            if (missing)                            cd->clrText = RGB(200, 40, 40);
-                            else if (!g_mods[idx].dllPath.empty())  cd->clrText = RGB(40, 130, 60);
-                            else                                     cd->clrText = RGB(130, 130, 130);
-                        }
-                    } else if (cd->iSubItem == COL_TSVER) {
-                        if (idx < g_mods.size()) {
-                            int cat = 0;
-                            TsStatusText(g_mods[idx], &cat);
-                            if (cat == 2)      cd->clrText = RGB(200, 40, 40);
-                            else if (cat == 1) cd->clrText = RGB(40, 130, 60);
-                            else               cd->clrText = RGB(130, 130, 130);
-                        }
-                    }
-                    return CDRF_DODEFAULT;
-                }
-            }
         }
         if (nh->hwndFrom == g_hWorlds || nh->hwndFrom == g_hChars) {
             if (nh->code == NM_CLICK || nh->code == NM_SETFOCUS)
@@ -2069,14 +2234,23 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
     Gdiplus::Status gdiStatus =
         Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, NULL);
     // Si GDI+ echoue a s'initialiser (tres rare), on continue quand meme :
-    // GetOrLoadIcon retombe alors sur g_defaultIconIdx == -1, donc simplement
-    // aucune icone affichee plutot qu'un crash.
+    // GetOrLoadHIcon/MakeDefaultIcon renverront simplement NULL, donc pas
+    // d'icone affichee plutot qu'un crash.
 
     NONCLIENTMETRICSW ncm;
     ncm.cbSize = sizeof(ncm);
     if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
         g_font = CreateFontIndirectW(&ncm.lfMessageFont);
     if (!g_font) g_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    // variante grasse du meme corps de police, pour le nom du mod sur chaque
+    // carte (repli sur g_font si la creation echoue, tres improbable).
+    LOGFONTW lfBold; memset(&lfBold, 0, sizeof(lfBold));
+    if (GetObjectW(g_font, sizeof(lfBold), &lfBold)) {
+        lfBold.lfWeight = FW_BOLD;
+        g_fontBold = CreateFontIndirectW(&lfBold);
+    }
+    if (!g_fontBold) g_fontBold = g_font;
 
     WNDCLASSEXW wc; memset(&wc, 0, sizeof(wc));
     wc.cbSize = sizeof(wc);
@@ -2108,7 +2282,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
     }
     (void)hAcc;
 
-    if (g_imgList) { ImageList_Destroy(g_imgList); g_imgList = NULL; }
+    if (!g_iconCache.empty()) {
+        for (std::map<std::wstring, HICON>::iterator it = g_iconCache.begin();
+             it != g_iconCache.end(); ++it)
+            DestroyIcon(it->second);
+        g_iconCache.clear();
+    }
+    if (g_defaultIcon) { DestroyIcon(g_defaultIcon); g_defaultIcon = NULL; }
+    if (g_fontBold && g_fontBold != g_font) { DeleteObject(g_fontBold); g_fontBold = NULL; }
     if (gdiStatus == Gdiplus::Ok) Gdiplus::GdiplusShutdown(g_gdiplusToken);
     OleUninitialize();
     return (int)msg.wParam;

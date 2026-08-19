@@ -6,19 +6,26 @@ l'appli se contente de retenir tes liens et la date où tu les as vérifiés.
 
 - Un seul `.exe`, aucune dépendance, ~200 Ko (GDI+ et les boîtes de dialogue
   de fichier sont livrées avec Windows).
-- Liste de mods : icône, nom, catégorie, lien, historique/changelog, DLL
-  associée, dernière vérification, note.
+- **Vue en cartes**, pas un tableau : icône bien visible (40×40), nom en
+  gras, une ligne de petits détails (catégorie · dernière vérif · état DLL ·
+  état Thunderstore), une ligne de note, et les boutons d'action directement
+  sur chaque carte :
   - **Watch** : ouvre le lien du mod
-  - **Historique** : ouvre la page des changements / versions (champ séparé)
-  - **Check update** : ouvre le lien + horodate la vérification
-  - **Vérifié** : horodate SANS ouvrir de lien — utile si tu as déjà vérifié
+  - **Hist.** : ouvre la page des changements / versions (champ séparé)
+  - **Check+** : ouvre le lien + horodate la vérification
+  - **OK** : horodate SANS ouvrir de lien — utile si tu as déjà vérifié
     ailleurs (Discord du mod, changelog déjà ouvert dans un autre onglet…)
-  - Clic droit sur un mod : menu avec toutes les actions, y compris localiser
-    le DLL installé dans l'explorateur
-  - Rouge si non vérifié depuis 30+ jours, orange 14+, gris si jamais vérifié
-  - La colonne DLL indique si le fichier associé est présent (vert),
-    manquant (rouge) ou non renseigné (gris), avec sa version quand elle est
-    lisible dans le fichier
+  - **TS** : interroge Thunderstore pour la dernière version publiée
+  - **DL** : télécharge le zip (voir plus bas)
+  - **Modif.** : modifie le mod
+  - **...** : copier le lien, localiser le DLL, ouvrir son dossier,
+    supprimer
+  - Tri via un menu déroulant + un bouton croissant/décroissant (nom,
+    catégorie, dernière vérif, DLL, MAJ Thunderstore, lien, note)
+  - La ligne de détails est colorée : rouge si un problème concret existe
+    (DLL manquant ou mise à jour disponible), orange si la dernière
+    vérification date de 14+ jours, vert si tout va bien, gris si jamais
+    vérifié
   - Icône par mod : PNG/JPG/BMP/ICO/GIF, choisie via un sélecteur de fichier
     dans l'éditeur (aperçu affiché), ou récupérée automatiquement (voir
     Auto-remplir ci-dessous)
@@ -26,18 +33,19 @@ l'appli se contente de retenir tes liens et la date où tu les as vérifiés.
     du mod, récupère nom, catégorie, lien historique, dernière version et
     icône (téléchargée dans `icons/` à côté de l'exe). Ne remplace jamais le
     chemin du DLL installé, qui reste propre à ta machine.
-  - **Verif. TS** : interroge l'API publique de Thunderstore (aucune clé
-    requise) pour connaître la dernière version publiée d'un mod, et la
-    compare à la version lue dans le DLL installé — colonne MAJ verte
-    (à jour), rouge (mise à jour dispo) ou grise (pas encore vérifié).
-    Ne fonctionne que pour les mods dont le lien pointe vers
-    `thunderstore.io` (Nexus/GitHub n'ont pas d'équivalent aussi simple
-    sans clé d'API). L'appel réseau est synchrone et déclenché mod par
-    mod sur clic explicite — pas de vérification automatique en masse.
-  - **Télécharger** : récupère le zip de la dernière version (via l'URL de
-    téléchargement officielle de Thunderstore) et l'enregistre dans
-    `downloads/` à côté de l'exe. Ne l'extrait **jamais** automatiquement —
-    ValMods reste manuel, c'est à toi de le déposer dans `BepInEx/plugins`.
+  - **TS** interroge l'API publique de Thunderstore (aucune clé requise) pour
+    connaître la dernière version publiée d'un mod, et la compare à la
+    version lue dans le DLL installé. Ne fonctionne que pour les mods dont
+    le lien pointe vers `thunderstore.io` (Nexus/GitHub n'ont pas
+    d'équivalent aussi simple sans clé d'API). L'appel réseau est synchrone
+    et déclenché mod par mod sur clic explicite — pas de vérification
+    automatique en masse.
+  - **DL** récupère le zip de la dernière version (via l'URL de
+    téléchargement officielle de Thunderstore) et ouvre une boîte
+    "Enregistrer sous..." pour choisir où le sauvegarder (suggestion par
+    défaut dans `downloads/`, entièrement modifiable). Ne l'extrait
+    **jamais** automatiquement — ValMods reste manuel, c'est à toi de le
+    déposer dans `BepInEx/plugins`.
 - Accès rapide aux dossiers `BepInEx/plugins`, `BepInEx/config`, dossier du
   jeu, dossier du DLL d'un mod donné.
 - Onglet Sauvegardes : liste des mondes et personnages (taille, date), backup
