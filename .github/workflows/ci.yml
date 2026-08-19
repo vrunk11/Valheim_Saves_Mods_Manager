@@ -44,13 +44,33 @@ jobs:
       # to speak of) — this is a smoke test, not coverage. It only proves
       # the binary launches and isn't missing a DLL; --version must exit 0
       # without opening a window, or this step would hang the runner.
+      #
+      # NOT `& $exe.FullName --version` + $LASTEXITCODE: PowerShell's call
+      # operator does not reliably wait for a /SUBSYSTEM:WINDOWS (GUI)
+      # process the way it does for a console one, so $LASTEXITCODE can
+      # still be $null when the next line reads it - and `$null -ne 0` is
+      # $true in PowerShell, so that check throws immediately with an empty
+      # exit code ("exited " with nothing after it) rather than the app's
+      # real result. Driving System.Diagnostics.Process directly forces an
+      # explicit, bounded wait and a real exit code either way.
       - name: Sanity check the binary
         shell: pwsh
         run: |
           $exe = Get-ChildItem -Recurse -Path build -Filter valmods.exe | Select-Object -First 1
           if (-not $exe) { throw "valmods.exe not found under build/" }
-          & $exe.FullName --version
-          if ($LASTEXITCODE -ne 0) { throw "valmods.exe --version exited $LASTEXITCODE" }
+
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = $exe.FullName
+          $psi.Arguments = '--version'
+          $psi.UseShellExecute = $false
+          $proc = [System.Diagnostics.Process]::Start($psi)
+
+          if (-not $proc.WaitForExit(10000)) {
+            $proc.Kill()
+            throw "valmods.exe --version did not exit within 10s - it may have opened a window instead of printing and exiting"
+          }
+          if ($proc.ExitCode -ne 0) { throw "valmods.exe --version exited $($proc.ExitCode)" }
+
           echo "EXE_PATH=$($exe.FullName)" >> $env:GITHUB_ENV
 
       - name: Upload build artifact
