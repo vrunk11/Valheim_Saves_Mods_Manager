@@ -28,7 +28,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX            // gdiplus.h utilise std::min/max ; les macros
                              // min/max de windows.h les masqueraient sinon.
-#define WINVER 0x0600        // sans ca, des macros comme SS_END_ELLIPSIS
+#define WINVER 0x0600        // sans ca, des macros comme SS_ENDELLIPSIS
                              // restent gardees derriere #if(WINVER >= ...)
                              // dans winuser.h et ne se declarent pas.
 #define _WIN32_WINNT 0x0600
@@ -1120,14 +1120,14 @@ static void RefillMods() {
           cc.stretch = false; g_cardChildren.push_back(cc); }
 
         MkCardStatic(m.name, textX, y + 8, 400, 20,
-            g_fontBold, 0, SS_LEFTNOWORDWRAP | SS_END_ELLIPSIS, true);
+            g_fontBold, 0, SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, true);
 
         MkCardStatic(BuildDetailsLine(m), textX, y + 30, 400, 18,
-            g_font, RowStatusColor(m), SS_LEFTNOWORDWRAP | SS_END_ELLIPSIS, true);
+            g_font, RowStatusColor(m), SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, true);
 
         std::wstring noteTxt = m.note.empty() ? L"" : (L"Note : " + m.note);
         MkCardStatic(noteTxt, textX, y + 50, 400, 18,
-            g_font, RGB(120, 120, 120), SS_LEFTNOWORDWRAP | SS_END_ELLIPSIS, true);
+            g_font, RGB(120, 120, 120), SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, true);
 
         int bx = textX, by = y + 72, bh = 24, gap = 4;
         int id = RA_BASE + (int)i * RA_COUNT;
