@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "valheimDir": "",
   "mods": [
     {
@@ -9,6 +9,7 @@
       "changelogUrl": "",
       "dllPath": "",
       "iconPath": "",
+      "tsVersion": "",
       "lastCheck": "",
       "note": "Supprime cette ligne, c'est juste un exemple."
     }

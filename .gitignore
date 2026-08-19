@@ -16,6 +16,7 @@ valmods.json.bad
 valmods.tsv
 valmods.ini
 backups/
+icons/
 
 # IDE
 .vs/

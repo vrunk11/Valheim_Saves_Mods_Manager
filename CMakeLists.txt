@@ -21,6 +21,7 @@ target_link_libraries(valmods PRIVATE
     gdiplus    # decode les icones de mod (PNG/JPG/BMP/ICO/GIF)
     version    # lit la version des DLL de mods installes
     comdlg32   # boites "Parcourir..." (choisir un DLL / une icone)
+    winhttp    # verification de version via l'API Thunderstore
 )
 
 if(MINGW)

@@ -20,7 +20,20 @@ l'appli se contente de retenir tes liens et la date où tu les as vérifiés.
     manquant (rouge) ou non renseigné (gris), avec sa version quand elle est
     lisible dans le fichier
   - Icône par mod : PNG/JPG/BMP/ICO/GIF, choisie via un sélecteur de fichier
-    dans l'éditeur (aperçu affiché)
+    dans l'éditeur (aperçu affiché), ou récupérée automatiquement (voir
+    Auto-remplir ci-dessous)
+  - **Auto-remplir depuis Thunderstore** (dans l'éditeur) : à partir du lien
+    du mod, récupère nom, catégorie, lien historique, dernière version et
+    icône (téléchargée dans `icons/` à côté de l'exe). Ne remplace jamais le
+    chemin du DLL installé, qui reste propre à ta machine.
+  - **Verif. TS** : interroge l'API publique de Thunderstore (aucune clé
+    requise) pour connaître la dernière version publiée d'un mod, et la
+    compare à la version lue dans le DLL installé — colonne MAJ verte
+    (à jour), rouge (mise à jour dispo) ou grise (pas encore vérifié).
+    Ne fonctionne que pour les mods dont le lien pointe vers
+    `thunderstore.io` (Nexus/GitHub n'ont pas d'équivalent aussi simple
+    sans clé d'API). L'appel réseau est synchrone et déclenché mod par
+    mod sur clic explicite — pas de vérification automatique en masse.
 - Accès rapide aux dossiers `BepInEx/plugins`, `BepInEx/config`, dossier du
   jeu, dossier du DLL d'un mod donné.
 - Onglet Sauvegardes : liste des mondes et personnages (taille, date), backup
@@ -79,7 +92,7 @@ release GitHub.
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "valheimDir": "D:\\SteamLibrary\\steamapps\\common\\Valheim",
   "mods": [
     {
@@ -89,6 +102,7 @@ release GitHub.
       "changelogUrl": "https://thunderstore.io/.../changelog/",
       "dllPath": "D:\\...\\BepInEx\\plugins\\ValheimPlus.dll",
       "iconPath": "C:\\Users\\...\\Pictures\\valheimplus.png",
+      "tsVersion": "0.9.9.16",
       "lastCheck": "2026-08-19 14:30",
       "note": "v0.9.9.16"
     }
@@ -96,8 +110,9 @@ release GitHub.
 }
 ```
 
-Un fichier `valmods.json` v1 (sans `changelogUrl`/`dllPath`/`iconPath`) reste
-lisible tel quel : les champs manquants sont simplement traités comme vides.
+Un fichier `valmods.json` plus ancien (sans `changelogUrl`/`dllPath`/
+`iconPath`/`tsVersion`) reste lisible tel quel : les champs manquants sont
+simplement traités comme vides.
 
 Fichier texte, éditable à la main. `valmods.json` n'est volontairement pas
 versionné (voir `.gitignore`) : c'est ta liste personnelle, pas un fichier

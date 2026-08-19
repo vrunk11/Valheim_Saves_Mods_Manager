@@ -33,6 +33,7 @@
 #include <shlobj.h>
 #include <shellapi.h>
 #include <winver.h>          // GetFileVersionInfoW / VerQueryValueW (version DLL)
+#include <winhttp.h>          // appels HTTPS vers l'API Thunderstore (verif de version)
 #include <objidl.h>
 #include <gdiplus.h>          // decode PNG/JPG/BMP/ICO/GIF pour les icones de mod
 #include <string>
@@ -40,6 +41,7 @@
 #include <map>
 #include <algorithm>
 #include <sstream>
+#include <cstdlib>
 #include <ctime>
 
 #include "minijson.h"
@@ -54,6 +56,7 @@
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "version.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "winhttp.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' \
 name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
 processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -70,6 +73,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_BMARK      1007
 #define IDC_BCOPY      1008
 #define IDC_BHIST      1009
+#define IDC_BTSCHECK   1018
 #define IDC_WORLDS     1010
 #define IDC_CHARS      1011
 #define IDC_LBL1       1012
@@ -99,22 +103,24 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDM_CTX_COPY        2106
 #define IDM_CTX_EDIT        2107
 #define IDM_CTX_DELETE      2108
+#define IDM_CTX_TSCHECK     2109
 
 // boutons propres a la fenetre d'edition d'un mod
 #define IDC_E_BROWSEDLL   3001
 #define IDC_E_BROWSEICON  3002
 #define IDC_E_CLEARICON   3003
+#define IDC_E_AUTOFILL    3004
 
 #define VALMODS_VERSION "1.2.0"
 
 // indices des colonnes de la liste des mods (utilises pour le tri et le
-// dessin personnalise de la colonne DLL)
+// dessin personnalise des colonnes DLL / MAJ Thunderstore)
 enum { COL_NAME = 0, COL_CAT = 1, COL_LASTCHECK = 2, COL_AGE = 3,
-       COL_DLL = 4, COL_URL = 5, COL_NOTE = 6 };
+       COL_DLL = 4, COL_TSVER = 5, COL_URL = 6, COL_NOTE = 7 };
 
 // ---------------------------------------------------------------- donnees
 struct Mod {
-    std::wstring name, cat, url, changelogUrl, dllPath, iconPath, last, note;
+    std::wstring name, cat, url, changelogUrl, dllPath, iconPath, tsVersion, last, note;
 };
 
 static HINSTANCE g_hInst = NULL;
@@ -458,12 +464,12 @@ static std::wstring DetectValheim() {
 //
 //   valmods.json
 //   {
-//     "version": 2,
+//     "version": 3,
 //     "valheimDir": "D:\\SteamLibrary\\steamapps\\common\\Valheim",
 //     "mods": [
 //       { "name": "...", "category": "...", "url": "...",
 //         "changelogUrl": "...", "dllPath": "...", "iconPath": "...",
-//         "lastCheck": "2026-08-19 14:30", "note": "..." }
+//         "tsVersion": "1.3.0", "lastCheck": "2026-08-19 14:30", "note": "..." }
 //     ]
 //   }
 static std::wstring DataFile()   { return ExeDir() + L"\\valmods.json"; }
@@ -472,7 +478,7 @@ static std::wstring LegacyFile() { return ExeDir() + L"\\valmods.tsv"; }
 static void SaveMods() {
     std::string out;
     out += "{\n";
-    out += "  \"version\": 2,\n";
+    out += "  \"version\": 3,\n";
     out += "  \"valheimDir\": " + mj::quote(W2U(g_valheimDir)) + ",\n";
     out += "  \"mods\": [\n";
     for (size_t i = 0; i < g_mods.size(); ++i) {
@@ -484,6 +490,7 @@ static void SaveMods() {
         out += "      \"changelogUrl\": " + mj::quote(W2U(m.changelogUrl)) + ",\n";
         out += "      \"dllPath\":      " + mj::quote(W2U(m.dllPath))      + ",\n";
         out += "      \"iconPath\":     " + mj::quote(W2U(m.iconPath))     + ",\n";
+        out += "      \"tsVersion\":    " + mj::quote(W2U(m.tsVersion))    + ",\n";
         out += "      \"lastCheck\":    " + mj::quote(W2U(m.last))         + ",\n";
         out += "      \"note\":         " + mj::quote(W2U(m.note))         + "\n";
         out += (i + 1 < g_mods.size()) ? "    },\n" : "    }\n";
@@ -544,6 +551,7 @@ static void LoadData() {
                     m.changelogUrl = Clean(U2W(v.s("changelogUrl")));
                     m.dllPath      = Clean(U2W(v.s("dllPath")));
                     m.iconPath     = Clean(U2W(v.s("iconPath")));
+                    m.tsVersion    = Clean(U2W(v.s("tsVersion")));
                     m.last         = Clean(U2W(v.s("lastCheck")));
                     m.note         = Clean(U2W(v.s("note")));
                     if (!m.name.empty() || !m.url.empty()) g_mods.push_back(m);
@@ -584,6 +592,7 @@ static bool ModLess(const Mod& a, const Mod& b) {
             break;
         }
         case COL_DLL: r = lstrcmpiW(a.dllPath.c_str(), b.dllPath.c_str()); break;
+        case COL_TSVER: r = lstrcmpiW(a.tsVersion.c_str(), b.tsVersion.c_str()); break;
         case COL_URL: r = lstrcmpiW(a.url.c_str(), b.url.c_str()); break;
         default:      r = lstrcmpiW(a.note.c_str(), b.note.c_str()); break;
     }
@@ -623,6 +632,314 @@ static std::wstring DllStatusText(const Mod& m, bool* missingOut) {
     return ver.empty() ? fn : (fn + L" (v" + ver + L")");
 }
 
+// ---------------------------------------------------------------- Thunderstore
+// Verification en ligne de la derniere version publiee, via l'API publique
+// de Thunderstore (aucune cle requise, en lecture seule) :
+//   GET https://thunderstore.io/api/experimental/package/{namespace}/{name}/
+// Ne fonctionne QUE pour les mods dont le lien pointe vers thunderstore.io ;
+// Nexus/GitHub ne sont pas interroges (pas d'equivalent aussi simple et sans
+// cle). L'appel est synchrone (bloque l'interface le temps de la requete,
+// quelques secondes au pire vu les timeouts ci-dessous) : c'est deliberement
+// simple plutot que threade, puisqu'il est declenche par un clic explicite
+// sur un seul mod, jamais automatiquement au demarrage ou sur toute la liste.
+
+// Extrait namespace/nom d'une URL de page Thunderstore, ex:
+// https://thunderstore.io/c/valheim/p/Namespace/PackageName/ -> ns=Namespace, name=PackageName
+// Accepte aussi les sous-domaines par communaute (.../package/Namespace/PackageName/).
+static bool ParseThunderstoreUrl(const std::wstring& url, std::wstring& ns, std::wstring& name) {
+    if (url.find(L"thunderstore.io") == std::wstring::npos) return false;
+    size_t marker = url.find(L"/p/");
+    size_t skip = 3;
+    if (marker == std::wstring::npos) { marker = url.find(L"/package/"); skip = 9; }
+    if (marker == std::wstring::npos) return false;
+    std::wstring rest = url.substr(marker + skip);
+    size_t q = rest.find_first_of(L"?#");
+    if (q != std::wstring::npos) rest = rest.substr(0, q);
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    for (size_t i = 0; i <= rest.size(); ++i) {
+        if (i == rest.size() || rest[i] == L'/') {
+            if (i > start) parts.push_back(rest.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    if (parts.size() < 2) return false;
+    ns = parts[0];
+    name = parts[1];
+    return true;
+}
+// Compare deux numeros de version "a.b.c[...]" composant par composant
+// (numeriquement) ; un composant manquant vaut 0. Suffit pour du SemVer
+// simple sans suffixe, seul format accepte par Thunderstore.
+static std::vector<int> ParseVersionParts(const std::wstring& v) {
+    std::vector<int> parts;
+    size_t start = 0;
+    for (size_t i = 0; i <= v.size(); ++i) {
+        if (i == v.size() || v[i] == L'.') {
+            if (i > start) parts.push_back(_wtoi(v.substr(start, i - start).c_str()));
+            start = i + 1;
+        }
+    }
+    return parts;
+}
+static bool VersionLess(const std::wstring& a, const std::wstring& b) {
+    std::vector<int> pa = ParseVersionParts(a), pb = ParseVersionParts(b);
+    size_t n = (pa.size() > pb.size()) ? pa.size() : pb.size();
+    for (size_t i = 0; i < n; ++i) {
+        int va = (i < pa.size()) ? pa[i] : 0;
+        int vb = (i < pb.size()) ? pb[i] : 0;
+        if (va != vb) return va < vb;
+    }
+    return false;
+}
+
+// Requete HTTPS GET minimale via WinHTTP (natif Windows, aucune dependance).
+// Malgre le nom historique, ceci lit des octets bruts, pas forcement de
+// l'UTF-8 : reutilise a la fois pour le JSON de l'API et pour telecharger
+// les icones PNG des mods (voir FetchThunderstoreAutofill plus bas).
+// Timeouts volontairement courts (resolution/connexion 5s, envoi/reception 8s)
+// pour ne pas bloquer l'interface trop longtemps en cas de reseau absent.
+static bool HttpGetBytes(const std::wstring& host, const std::wstring& path,
+                         std::string& outBody, DWORD& outStatus, std::wstring& errOut)
+{
+    outBody.clear(); outStatus = 0; errOut.clear();
+    HINTERNET hSession = WinHttpOpen(L"ValMods (Windows)", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) { errOut = L"Impossible d'initialiser WinHTTP."; return false; }
+    WinHttpSetTimeouts(hSession, 5000, 5000, 8000, 8000);
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) {
+        errOut = L"Connexion impossible a " + host + L" (verifie ta connexion internet).";
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(), NULL,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) {
+        errOut = L"Impossible de preparer la requete.";
+        WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    BOOL ok = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    if (ok) ok = WinHttpReceiveResponse(hRequest, NULL);
+    if (!ok) {
+        errOut = L"Pas de reponse du serveur (delai depasse ou pas de connexion).";
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    DWORD statusSize = sizeof(outStatus);
+    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &outStatus, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
+    for (;;) {
+        DWORD avail = 0;
+        if (!WinHttpQueryDataAvailable(hRequest, &avail) || avail == 0) break;
+        std::vector<char> buf(avail);
+        DWORD got = 0;
+        if (!WinHttpReadData(hRequest, &buf[0], avail, &got)) break;
+        outBody.append(&buf[0], got);
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return outStatus != 0;
+}
+// Decoupe une URL https://host/chemin en host + chemin, pour WinHttpConnect
+// (qui veut le host separement). Retourne false si ce n'est pas du https.
+static bool SplitHttpsUrl(const std::wstring& url, std::wstring& host, std::wstring& path) {
+    const std::wstring prefix = L"https://";
+    if (url.compare(0, prefix.size(), prefix) != 0) return false;
+    size_t rest = prefix.size();
+    size_t slash = url.find(L'/', rest);
+    if (slash == std::wstring::npos) { host = url.substr(rest); path = L"/"; return !host.empty(); }
+    host = url.substr(rest, slash - rest);
+    path = url.substr(slash);
+    return !host.empty();
+}
+// Nom de fichier sur : ne garde que [A-Za-z0-9_.-], le reste devient '_'.
+static std::wstring SanitizeFileName(const std::wstring& s) {
+    std::wstring out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        wchar_t c = s[i];
+        bool ok = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+                  (c >= L'0' && c <= L'9') || c == L'_' || c == L'-' || c == L'.';
+        out += ok ? c : L'_';
+    }
+    return out.empty() ? L"icon" : out;
+}
+
+// Recupere et parse le JSON du package Thunderstore correspondant a l'URL
+// d'un mod. Partage par CheckThunderstoreVersion (bouton "Verif. TS") et
+// FetchThunderstoreAutofill (bouton "Auto-remplir") pour ne pas dupliquer
+// la logique reseau + gestion d'erreurs entre les deux.
+struct TsFetchResult {
+    bool ok;
+    bool isThunderstore;
+    std::wstring error;
+    mj::Value root;
+    TsFetchResult() : ok(false), isThunderstore(false) {}
+};
+static TsFetchResult FetchThunderstorePackage(const std::wstring& modUrl) {
+    TsFetchResult r;
+    std::wstring ns, name;
+    if (!ParseThunderstoreUrl(modUrl, ns, name)) return r;   // isThunderstore reste false
+    r.isThunderstore = true;
+
+    std::wstring path = L"/api/experimental/package/" + ns + L"/" + name + L"/";
+    std::string body; DWORD status = 0; std::wstring err;
+    if (!HttpGetBytes(L"thunderstore.io", path, body, status, err)) {
+        r.error = err.empty() ? L"Echec de la requete." : err;
+        return r;
+    }
+    if (status == 404) {
+        r.error = L"Mod introuvable sur Thunderstore (lien casse, mod retire, ou "
+                  L"nom/namespace incorrect dans l'URL).";
+        return r;
+    }
+    if (status != 200) {
+        wchar_t b[64]; wsprintfW(b, L"Thunderstore a repondu avec le code %lu.", (unsigned long)status);
+        r.error = b;
+        return r;
+    }
+    if (!mj::parse(body, r.root) || r.root.type != mj::OBJ) {
+        r.error = L"Reponse Thunderstore illisible (format inattendu).";
+        return r;
+    }
+    r.ok = true;
+    return r;
+}
+// Trouve, dans le tableau "versions" du JSON, l'entree ayant le plus haut
+// numero de version (le tri renvoye par l'API n'est pas garanti). Renvoie
+// NULL si aucune version exploitable n'a ete trouvee.
+static const mj::Value* FindLatestVersionEntry(const mj::Value& root, std::wstring& outVersion) {
+    outVersion.clear();
+    const mj::Value* versions = root.find("versions");
+    if (!versions || versions->type != mj::ARR) return NULL;
+    const mj::Value* best = NULL;
+    for (size_t i = 0; i < versions->arr.size(); ++i) {
+        if (versions->arr[i].type != mj::OBJ) continue;
+        std::wstring vn = U2W(versions->arr[i].s("version_number"));
+        if (vn.empty()) continue;
+        if (outVersion.empty() || VersionLess(outVersion, vn)) {
+            outVersion = vn;
+            best = &versions->arr[i];
+        }
+    }
+    return best;
+}
+
+struct TsCheckResult {
+    bool ok;              // requete + parsing reussis, latestVersion exploitable
+    bool isThunderstore;  // le lien du mod pointait bien vers thunderstore.io
+    bool deprecated;
+    std::wstring latestVersion;
+    std::wstring error;
+    TsCheckResult() : ok(false), isThunderstore(false), deprecated(false) {}
+};
+
+static TsCheckResult CheckThunderstoreVersion(const std::wstring& modUrl) {
+    TsCheckResult r;
+    TsFetchResult f = FetchThunderstorePackage(modUrl);
+    r.isThunderstore = f.isThunderstore;
+    if (!f.isThunderstore) return r;
+    if (!f.ok) { r.error = f.error; return r; }
+
+    std::wstring latest;
+    if (!FindLatestVersionEntry(f.root, latest)) {
+        r.error = L"Aucune version exploitable listee pour ce mod dans la reponse.";
+        return r;
+    }
+    r.latestVersion = latest;
+
+    const mj::Value* dep = f.root.find("is_deprecated");
+    r.deprecated = (dep && dep->type == mj::BOOL && dep->b);
+    r.ok = true;
+    return r;
+}
+
+// Recupere nom / categorie / lien historique / derniere version / icone
+// depuis Thunderstore pour pre-remplir l'editeur de mod (bouton
+// "Auto-remplir"). L'icone est telechargee et enregistree localement dans
+// icons/ a cote de l'exe (GDI+ sait ensuite la charger comme n'importe quel
+// autre fichier d'icone choisi a la main).
+struct TsAutofillResult {
+    bool ok;
+    bool isThunderstore;
+    std::wstring error;
+    std::wstring name, category, changelogUrl, latestVersion, localIconPath;
+    TsAutofillResult() : ok(false), isThunderstore(false) {}
+};
+static TsAutofillResult FetchThunderstoreAutofill(const std::wstring& modUrl) {
+    TsAutofillResult r;
+    TsFetchResult f = FetchThunderstorePackage(modUrl);
+    r.isThunderstore = f.isThunderstore;
+    if (!f.isThunderstore) return r;
+    if (!f.ok) { r.error = f.error; return r; }
+
+    r.name = Clean(U2W(f.root.s("name")));
+
+    const mj::Value* cats = f.root.find("categories");
+    if (cats && cats->type == mj::ARR) {
+        for (size_t i = 0; i < cats->arr.size(); ++i) {
+            if (cats->arr[i].type != mj::STR) continue;
+            if (!r.category.empty()) r.category += L", ";
+            r.category += U2W(cats->arr[i].str);
+        }
+    }
+
+    std::wstring latest;
+    const mj::Value* bestEntry = FindLatestVersionEntry(f.root, latest);
+    if (!bestEntry) { r.error = L"Aucune version exploitable listee pour ce mod dans la reponse."; return r; }
+    r.latestVersion = latest;
+
+    std::wstring changelog = modUrl;
+    if (!changelog.empty() && changelog[changelog.size() - 1] != L'/') changelog += L'/';
+    changelog += L"changelog/";
+    r.changelogUrl = changelog;
+
+    std::wstring iconUrl = U2W(bestEntry->s("icon"));
+    if (!iconUrl.empty()) {
+        std::wstring host, path;
+        if (SplitHttpsUrl(iconUrl, host, path)) {
+            std::string bytes; DWORD status = 0; std::wstring err;
+            if (HttpGetBytes(host, path, bytes, status, err) && status == 200 && !bytes.empty()) {
+                std::wstring ns, nm;
+                ParseThunderstoreUrl(modUrl, ns, nm);   // deja valide via f.isThunderstore
+                std::wstring dir = ExeDir() + L"\\icons";
+                MakeDirs(dir);
+                std::wstring dest = dir + L"\\" + SanitizeFileName(ns) + L"-" + SanitizeFileName(nm) + L".png";
+                if (WriteAllBytes(dest, bytes)) r.localIconPath = dest;
+            }
+            // l'icone est un bonus : si le telechargement echoue, on continue
+            // quand meme avec le reste des champs plutot que de tout faire echouer.
+        }
+    }
+
+    r.ok = true;
+    return r;
+}
+
+// Texte + categorie de couleur pour la colonne "MAJ" : 0 gris (inconnu),
+// 1 vert (a jour), 2 rouge (mise a jour disponible).
+static std::wstring TsStatusText(const Mod& m, int* colorCategory) {
+    if (colorCategory) *colorCategory = 0;
+    if (m.tsVersion.empty()) return L"-";
+    std::wstring installed = m.dllPath.empty() ? L"" : GetDllVersionString(m.dllPath);
+    if (installed.empty()) return m.tsVersion;   // derniere version connue, mais rien a comparer
+    if (VersionLess(installed, m.tsVersion)) {
+        if (colorCategory) *colorCategory = 2;
+        return m.tsVersion + L" (maj disponible)";
+    }
+    if (colorCategory) *colorCategory = 1;
+    return m.tsVersion + L" (a jour)";
+}
+
 // ---------------------------------------------------------------- liste mods
 static void RefillMods() {
     std::stable_sort(g_mods.begin(), g_mods.end(), ModLess);
@@ -643,6 +960,8 @@ static void RefillMods() {
         ListView_SetItemText(g_hMods, (int)i, COL_AGE, (LPWSTR)dt.c_str());
         std::wstring dllTxt = DllStatusText(g_mods[i], NULL);
         ListView_SetItemText(g_hMods, (int)i, COL_DLL, (LPWSTR)dllTxt.c_str());
+        std::wstring tsTxt = TsStatusText(g_mods[i], NULL);
+        ListView_SetItemText(g_hMods, (int)i, COL_TSVER, (LPWSTR)tsTxt.c_str());
         ListView_SetItemText(g_hMods, (int)i, COL_URL, (LPWSTR)g_mods[i].url.c_str());
         ListView_SetItemText(g_hMods, (int)i, COL_NOTE, (LPWSTR)g_mods[i].note.c_str());
     }
@@ -742,8 +1061,9 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         c->hCat = MkEdit(hwnd, c->m.cat, LX, 76, LW);
         MkLabel(hwnd, L"Lien de la page du mod *", LX, 106, LW);
         c->hUrl = MkEdit(hwnd, c->m.url, LX, 124, LW);
-        MkLabel(hwnd, L"Lien historique / changelog (optionnel)", LX, 154, LW);
-        c->hHist = MkEdit(hwnd, c->m.changelogUrl, LX, 172, LW);
+        MkDlgButton(hwnd, IDC_E_AUTOFILL, L"Auto-remplir depuis Thunderstore", LX, 150, 220, 24);
+        MkLabel(hwnd, L"Lien historique / changelog (optionnel)", LX, 184, LW);
+        c->hHist = MkEdit(hwnd, c->m.changelogUrl, LX, 202, LW);
 
         // -- colonne de droite : icone (apercu + parcourir + effacer) -------
         const int IX = LX + LW + 16;   // 388
@@ -755,19 +1075,19 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         MkDlgButton(hwnd, IDC_E_CLEARICON,  L"Effacer",      IX, 100, 130, 24);
 
         // -- DLL associe, pleine largeur -------------------------------------
-        MkLabel(hwnd, L"DLL installe (pour verifier qu'il est bien present)", LX, 202, LW + 16 + 130);
-        c->hDll = MkEdit(hwnd, c->m.dllPath, LX, 220, LW);
-        MkDlgButton(hwnd, IDC_E_BROWSEDLL, L"Parcourir...", LX + LW + 24, 220, 124, 24);
+        MkLabel(hwnd, L"DLL installe (pour verifier qu'il est bien present)", LX, 232, LW + 16 + 130);
+        c->hDll = MkEdit(hwnd, c->m.dllPath, LX, 250, LW);
+        MkDlgButton(hwnd, IDC_E_BROWSEDLL, L"Parcourir...", LX + LW + 24, 250, 124, 24);
 
-        MkLabel(hwnd, L"Note (version installee, remarques...)", LX, 250, LW + 16 + 130);
-        c->hNote = MkEdit(hwnd, c->m.note, LX, 268, LW + 16 + 130);
+        MkLabel(hwnd, L"Note (version installee, remarques...)", LX, 280, LW + 16 + 130);
+        c->hNote = MkEdit(hwnd, c->m.note, LX, 298, LW + 16 + 130);
 
         HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            336, 306, 92, 28, hwnd, (HMENU)IDOK, g_hInst, NULL);
+            336, 336, 92, 28, hwnd, (HMENU)IDOK, g_hInst, NULL);
         HWND ca = CreateWindowExW(0, L"BUTTON", L"Annuler",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            436, 306, 92, 28, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
+            436, 336, 92, 28, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
         SendMessageW(ok, WM_SETFONT, (WPARAM)g_font, TRUE);
         SendMessageW(ca, WM_SETFONT, (WPARAM)g_font, TRUE);
 
@@ -777,6 +1097,49 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_COMMAND:
+        if (LOWORD(wp) == IDC_E_AUTOFILL && c) {
+            std::wstring url = Clean(GetTextOf(c->hUrl));
+            if (url.empty()) {
+                MessageBoxW(hwnd, L"Renseigne d'abord le lien de la page du mod.",
+                    L"ValMods", MB_OK | MB_ICONINFORMATION);
+                return 0;
+            }
+            HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
+            TsAutofillResult r = FetchThunderstoreAutofill(url);
+            SetCursor(oldCursor);
+
+            if (!r.isThunderstore) {
+                MessageBoxW(hwnd,
+                    L"Ce lien ne pointe pas vers thunderstore.io :\n"
+                    L"l'auto-remplissage ne fonctionne que pour les mods\n"
+                    L"heberges sur Thunderstore.",
+                    L"ValMods", MB_OK | MB_ICONWARNING);
+                return 0;
+            }
+            if (!r.ok) {
+                std::wstring m = L"Auto-remplissage impossible :\n" + r.error;
+                MessageBoxW(hwnd, m.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
+                return 0;
+            }
+
+            // remplace toujours les champs concernes : un clic explicite sur
+            // "Auto-remplir" veut dire "je veux les donnees fraiches de Thunderstore".
+            if (!r.name.empty())         SetWindowTextW(c->hName, r.name.c_str());
+            if (!r.category.empty())     SetWindowTextW(c->hCat, r.category.c_str());
+            if (!r.changelogUrl.empty()) SetWindowTextW(c->hHist, r.changelogUrl.c_str());
+            if (!r.localIconPath.empty()) {
+                SetWindowTextW(c->hIcon, r.localIconPath.c_str());
+                UpdateIconPreview(c, r.localIconPath);
+            }
+            c->m.tsVersion = r.latestVersion;   // porte jusqu'a l'enregistrement (pas de champ texte dedie)
+
+            std::wstring summary = L"Champs remplis depuis Thunderstore.\n"
+                L"Derniere version publiee : " + r.latestVersion;
+            if (r.localIconPath.empty())
+                summary += L"\n(icone non recuperee - le mod n'en a peut-etre pas)";
+            Info(hwnd, summary.c_str());
+            return 0;
+        }
         if (LOWORD(wp) == IDC_E_BROWSEDLL && c) {
             std::wstring picked = BrowseFile(hwnd,
                 L"Bibliotheques (*.dll)\0*.dll\0Tous les fichiers (*.*)\0*.*\0",
@@ -845,7 +1208,7 @@ static bool ShowModEditor(HWND parent, const wchar_t* title, Mod& io) {
         reg = true;
     }
     EditCtx ctx; ctx.m = io;
-    RECT r = { 0, 0, 540, 350 };
+    RECT r = { 0, 0, 540, 380 };
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     AdjustWindowRect(&r, style, FALSE);
     RECT pr; GetWindowRect(parent, &pr);
@@ -1067,6 +1430,47 @@ static void ActionOpenDllDir(HWND hwnd) {
     std::wstring dir = (s == std::wstring::npos) ? PluginsDir() : p.substr(0, s);
     OpenFolder(hwnd, dir, L"dossier du DLL");
 }
+static void ActionCheckThunderstore(HWND hwnd) {
+    int i = SelectedMod();
+    if (i < 0) { Info(hwnd, L"Selectionne un mod dans la liste."); return; }
+    std::wstring name = g_mods[i].name;
+    std::wstring url = g_mods[i].url;
+
+    HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
+    TsCheckResult r = CheckThunderstoreVersion(url);
+    SetCursor(oldCursor);
+
+    if (!r.isThunderstore) {
+        Info(hwnd, L"Le lien de ce mod ne pointe pas vers thunderstore.io.\n"
+                   L"La verification automatique ne fonctionne que pour les mods\n"
+                   L"heberges sur Thunderstore (Nexus, GitHub... ne sont pas geres).");
+        return;
+    }
+    if (!r.ok) {
+        std::wstring m = L"Verification impossible :\n" + r.error;
+        MessageBoxW(hwnd, m.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // la liste peut avoir ete retriee pendant l'appel reseau : on retrouve
+    // le mod par son nom plutot que de garder l'index d'avant l'appel.
+    for (size_t k = 0; k < g_mods.size(); ++k) {
+        if (g_mods[k].name == name) {
+            g_mods[k].tsVersion = r.latestVersion;
+            g_mods[k].last = NowStamp();   // une verification en ligne compte comme une verification
+            SaveMods();
+            RefillMods();
+            SelectMod((int)k);
+            break;
+        }
+    }
+
+    std::wstring msg = L"Derniere version publiee sur Thunderstore : " + r.latestVersion;
+    if (r.deprecated)
+        msg += L"\n\nATTENTION : ce mod est marque comme deprecie (abandonne) "
+              L"par son auteur sur Thunderstore.";
+    Info(hwnd, msg.c_str());
+}
 
 // ---------------------------------------------------------------- parametres
 static int CALLBACK BrowseCB(HWND hwnd, UINT msg, LPARAM lp, LPARAM data) {
@@ -1116,10 +1520,12 @@ static void LayoutAll(HWND hwnd) {
     // --- onglet mods : deux rangees de boutons + liste
     const int bw = 104, bh = 28, gap = 6;
     int row1[4] = { IDC_BADD, IDC_BEDIT, IDC_BDEL, IDC_BCOPY };
-    int row2[4] = { IDC_BWATCH, IDC_BHIST, IDC_BCHECK, IDC_BMARK };
+    int row2[5] = { IDC_BWATCH, IDC_BHIST, IDC_BCHECK, IDC_BMARK, IDC_BTSCHECK };
     for (int i = 0; i < 4; ++i) {
         HWND b1 = GetDlgItem(hwnd, row1[i]);
         if (b1) MoveWindow(b1, px + i * (bw + gap), py, bw, bh, TRUE);
+    }
+    for (int i = 0; i < 5; ++i) {
         HWND b2 = GetDlgItem(hwnd, row2[i]);
         if (b2) MoveWindow(b2, px + i * (bw + gap), py + bh + gap, bw, bh, TRUE);
     }
@@ -1236,15 +1642,17 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BHIST,  L"Historique");
         g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BCHECK, L"Check update");
         g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BMARK,  L"Verifie");
+        g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BTSCHECK, L"Verif. TS");
         g_hMods = MkList(hwnd, IDC_MODLIST);
         g_pageMods[g_nMods++] = g_hMods;
-        AddCol(g_hMods, COL_NAME,      L"Mod", 200);
-        AddCol(g_hMods, COL_CAT,       L"Categorie", 120);
-        AddCol(g_hMods, COL_LASTCHECK, L"Derniere verif", 120);
-        AddCol(g_hMods, COL_AGE,       L"Age", 55);
-        AddCol(g_hMods, COL_DLL,       L"DLL", 190);
-        AddCol(g_hMods, COL_URL,       L"Lien", 260);
-        AddCol(g_hMods, COL_NOTE,      L"Note", 160);
+        AddCol(g_hMods, COL_NAME,      L"Mod", 190);
+        AddCol(g_hMods, COL_CAT,       L"Categorie", 110);
+        AddCol(g_hMods, COL_LASTCHECK, L"Derniere verif", 115);
+        AddCol(g_hMods, COL_AGE,       L"Age", 50);
+        AddCol(g_hMods, COL_DLL,       L"DLL", 170);
+        AddCol(g_hMods, COL_TSVER,     L"MAJ (Thunderstore)", 150);
+        AddCol(g_hMods, COL_URL,       L"Lien", 220);
+        AddCol(g_hMods, COL_NOTE,      L"Note", 140);
 
         // icone par mod : petite image list 16x16 alimentee a la volee
         // (voir GetOrLoadIcon) via GDI+, avec une icone grise par defaut.
@@ -1275,6 +1683,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             AddTip(GetDlgItem(hwnd, IDC_BMARK),
                 L"Note la date de verification SANS ouvrir de lien - utile si tu as deja "
                 L"verifie ailleurs (Discord du mod, changelog deja ouvert dans un autre onglet...)");
+            AddTip(GetDlgItem(hwnd, IDC_BTSCHECK),
+                L"Interroge l'API publique de Thunderstore pour connaitre la derniere "
+                L"version publiee (uniquement pour les mods heberges sur thunderstore.io)");
         }
 
 
@@ -1333,11 +1744,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_BCHECK: ActionOpen(hwnd, true);   return 0;
         case IDC_BMARK:  ActionMark(hwnd);         return 0;
         case IDC_BCOPY:  ActionCopy(hwnd);         return 0;
+        case IDC_BTSCHECK: ActionCheckThunderstore(hwnd); return 0;
 
         case IDM_CTX_WATCH:       ActionOpen(hwnd, false); return 0;
         case IDM_CTX_HIST:        ActionOpenHistory(hwnd); return 0;
         case IDM_CTX_CHECK:       ActionOpen(hwnd, true);  return 0;
         case IDM_CTX_MARK:        ActionMark(hwnd);        return 0;
+        case IDM_CTX_TSCHECK:     ActionCheckThunderstore(hwnd); return 0;
         case IDM_CTX_LOCATE_DLL:  ActionLocateDll(hwnd);   return 0;
         case IDM_CTX_OPEN_DLLDIR: ActionOpenDllDir(hwnd);  return 0;
         case IDM_CTX_COPY:        ActionCopy(hwnd);        return 0;
@@ -1373,6 +1786,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 L"Clic sur un en-tete de colonne : tri\n\n"
                 L"La colonne DLL indique si le fichier associe au mod est present (vert),\n"
                 L"manquant (rouge) ou non renseigne (gris).\n\n"
+                L"Verif. TS interroge l'API publique de Thunderstore pour connaitre la\n"
+                L"derniere version publiee (uniquement pour les mods heberges sur\n"
+                L"thunderstore.io - Nexus/GitHub ne sont pas geres). La colonne MAJ\n"
+                L"compare cette version a celle du DLL installe : vert = a jour,\n"
+                L"rouge = mise a jour disponible, gris = pas encore verifie / inconnu.\n\n"
+                L"Dans l'editeur, Auto-remplir depuis Thunderstore recupere le nom, la\n"
+                L"categorie, le lien historique, la derniere version et l'icone du mod\n"
+                L"a partir du lien colle (meme limite : Thunderstore uniquement).\n\n"
                 L"Les mods non verifies depuis plus de 30 jours sont en rouge,\n"
                 L"ceux jamais verifies en gris.\n\n"
                 L"Donnees : valmods.json, a cote de l'exe.";
@@ -1407,6 +1828,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     AppendMenuW(m, MF_STRING, IDM_CTX_HIST,        L"Ouvrir l'historique des versions");
                     AppendMenuW(m, MF_STRING, IDM_CTX_CHECK,       L"Ouvrir le lien + noter la verification");
                     AppendMenuW(m, MF_STRING, IDM_CTX_MARK,        L"Noter la verification (sans ouvrir)");
+                    AppendMenuW(m, MF_STRING, IDM_CTX_TSCHECK,     L"Verifier la derniere version (Thunderstore)");
                     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
                     AppendMenuW(m, MF_STRING, IDM_CTX_LOCATE_DLL,  L"Localiser le DLL dans l'explorateur");
                     AppendMenuW(m, MF_STRING, IDM_CTX_OPEN_DLLDIR, L"Ouvrir le dossier du DLL");
@@ -1436,14 +1858,22 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return CDRF_NOTIFYSUBITEMDRAW;
                 }
                 if (cd->nmcd.dwDrawStage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM)) {
+                    size_t idx = (size_t)cd->nmcd.lItemlParam;
                     if (cd->iSubItem == COL_DLL) {
-                        size_t idx = (size_t)cd->nmcd.lItemlParam;
                         if (idx < g_mods.size()) {
                             bool missing = false;
                             DllStatusText(g_mods[idx], &missing);
                             if (missing)                            cd->clrText = RGB(200, 40, 40);
                             else if (!g_mods[idx].dllPath.empty())  cd->clrText = RGB(40, 130, 60);
                             else                                     cd->clrText = RGB(130, 130, 130);
+                        }
+                    } else if (cd->iSubItem == COL_TSVER) {
+                        if (idx < g_mods.size()) {
+                            int cat = 0;
+                            TsStatusText(g_mods[idx], &cat);
+                            if (cat == 2)      cd->clrText = RGB(200, 40, 40);
+                            else if (cat == 1) cd->clrText = RGB(40, 130, 60);
+                            else               cd->clrText = RGB(130, 130, 130);
                         }
                     }
                     return CDRF_DODEFAULT;
