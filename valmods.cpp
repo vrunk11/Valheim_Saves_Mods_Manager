@@ -90,6 +90,21 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 enum { RA_WATCH = 0, RA_HIST = 1, RA_CHECK = 2, RA_MARK = 3, RA_TS = 4,
        RA_DL = 5, RA_EDIT = 6, RA_MORE = 7, RA_COUNT = 8 };
 
+// Un bouton de carte declenche son action via un message DIFFERE
+// (PostMessage), jamais executee directement dans le gestionnaire de
+// WM_COMMAND : l'action (ex: Verifie) peut appeler RefillMods(), qui detruit
+// et recree TOUTES les cartes - y compris le bouton en train d'etre clique,
+// dont le propre traitement de clic n'a pas fini de se derouler dans la pile
+// d'appels (WM_COMMAND est relaye de facon synchrone depuis le panneau de
+// cartes). Detruire une fenetre pendant qu'elle traite encore son propre
+// evenement est un piege classique en Win32. Poster differe l'execution
+// reelle a la prochaine iteration de la boucle de messages, une fois que le
+// clic du bouton s'est completement termine et que la pile s'est deroulee.
+#define WM_APP_ROWACTION (WM_APP + 1)
+// actions du menu "..." (pas encodees dans l'id d'un bouton - la cible est
+// g_ctxMenuModIndex, pose au moment d'ouvrir le menu)
+enum { RA_MENU_COPY = 100, RA_MENU_LOCATE_DLL = 101, RA_MENU_OPEN_DLLDIR = 102, RA_MENU_DELETE = 103 };
+
 #define IDM_OPENDATA   2001
 #define IDM_EXIT       2002
 #define IDM_PLUGINS    2003
@@ -124,7 +139,7 @@ enum { COL_NAME = 0, COL_CAT = 1, COL_LASTCHECK = 2, COL_AGE = 3,
 
 // ---------------------------------------------------------------- donnees
 struct Mod {
-    std::wstring name, cat, url, changelogUrl, dllPath, iconPath, tsVersion, last, note;
+    std::wstring name, cat, url, changelogUrl, dllPath, iconPath, tsVersion, description, last, note;
 };
 
 static HINSTANCE g_hInst = NULL;
@@ -266,19 +281,74 @@ static std::wstring ClipboardText() {
 // (PNG/JPG/BMP/ICO/GIF) via GDI+. GDI+ est livre avec Windows depuis XP :
 // aucune dependance ajoutee, et il decode bien plus de formats que LoadImage
 // (qui ne sait lire nativement que BMP/ICO/CUR).
+//
+// On NE PASSE PAS par Gdiplus::Bitmap::GetHICON() : cette fonction est connue
+// pour produire des icones noires ou totalement invisibles des qu'un canal
+// alpha est utilise, sur pas mal de configurations Windows (probleme GDI+
+// documente, pas specifique a ce code). A la place, AlphaIconBuilder dessine
+// dans un DIB section 32bpp premultiplie qu'on connait a l'avance, puis
+// construit l'icone a la main via CreateIconIndirect - la methode fiable
+// pour une icone avec vraie transparence.
+struct AlphaIconBuilder {
+    HBITMAP hbm;
+    void* bits;
+    Gdiplus::Bitmap* gdiBmp;
+    int size;
+    explicit AlphaIconBuilder(int sz) : hbm(NULL), bits(NULL), gdiBmp(NULL), size(sz) {
+        BITMAPV5HEADER bi; memset(&bi, 0, sizeof(bi));
+        bi.bV5Size = sizeof(BITMAPV5HEADER);
+        bi.bV5Width = size;
+        bi.bV5Height = -size;            // negatif = top-down, evite tout flip manuel
+        bi.bV5Planes = 1;
+        bi.bV5BitCount = 32;
+        bi.bV5Compression = BI_BITFIELDS;
+        bi.bV5RedMask   = 0x00FF0000;
+        bi.bV5GreenMask = 0x0000FF00;
+        bi.bV5BlueMask  = 0x000000FF;
+        bi.bV5AlphaMask = 0xFF000000;
+        HDC screenDc = GetDC(NULL);
+        hbm = CreateDIBSection(screenDc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, NULL, 0);
+        ReleaseDC(NULL, screenDc);
+        if (hbm && bits) {
+            memset(bits, 0, (size_t)size * (size_t)size * 4);   // transparent au depart
+            // PixelFormat32bppPARGB (alpha premultipliee) : le format attendu
+            // par un HBITMAP consomme ensuite comme icone a canal alpha.
+            gdiBmp = new Gdiplus::Bitmap(size, size, size * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+        }
+    }
+    ~AlphaIconBuilder() {
+        delete gdiBmp;
+        if (hbm) DeleteObject(hbm);
+    }
+    bool ok() const { return hbm && bits && gdiBmp && gdiBmp->GetLastStatus() == Gdiplus::Ok; }
+    // hbmColor est REUTILISE tel quel par CreateIconIndirect (qui en fait sa
+    // propre copie interne) : on peut le detruire nous-memes juste apres,
+    // le destructeur s'en charge normalement.
+    HICON ToIcon() {
+        if (!ok()) return NULL;
+        HBITMAP hMask = CreateBitmap(size, size, 1, 1, NULL);
+        if (!hMask) return NULL;
+        ICONINFO ii; memset(&ii, 0, sizeof(ii));
+        ii.fIcon = TRUE;
+        ii.hbmColor = hbm;
+        ii.hbmMask = hMask;
+        HICON hIcon = CreateIconIndirect(&ii);
+        DeleteObject(hMask);
+        return hIcon;
+    }
+};
+
 static HICON MakeDefaultIcon(int size) {
-    Gdiplus::Bitmap bmp((INT)size, (INT)size, PixelFormat32bppARGB);
-    Gdiplus::Graphics g(&bmp);
+    AlphaIconBuilder b(size);
+    if (!b.ok()) return NULL;
+    Gdiplus::Graphics g(b.gdiBmp);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    g.Clear(Gdiplus::Color(0, 0, 0, 0));
     Gdiplus::SolidBrush fill(Gdiplus::Color(255, 100, 100, 112));
     Gdiplus::Pen pen(Gdiplus::Color(255, 60, 60, 70), 1.0f);
     float pad = 1.0f, s = (float)size;
     g.FillRectangle(&fill, pad, pad, s - 2 * pad, s - 2 * pad);
     g.DrawRectangle(&pen, pad, pad, s - 2 * pad, s - 2 * pad);
-    HICON h = NULL;
-    if (bmp.GetHICON(&h) != Gdiplus::Ok) return NULL;
-    return h;   // NULL si GDI+ n'a pas pu s'initialiser : les appelants le gerent
+    return b.ToIcon();
 }
 static HICON LoadScaledIconFromFile(const std::wstring& path, int size) {
     if (path.empty() || !FileExists(path)) return NULL;
@@ -288,20 +358,18 @@ static HICON LoadScaledIconFromFile(const std::wstring& path, int size) {
         delete src;
         return NULL;
     }
-    Gdiplus::Bitmap dest((INT)size, (INT)size, PixelFormat32bppARGB);
-    Gdiplus::Graphics g(&dest);
+    AlphaIconBuilder b(size);
+    if (!b.ok()) { delete src; return NULL; }
+    Gdiplus::Graphics g(b.gdiBmp);
     g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    g.Clear(Gdiplus::Color(0, 0, 0, 0));
     float sw = (float)src->GetWidth(), sh = (float)src->GetHeight();
     float scale = (sw > sh) ? (float)size / sw : (float)size / sh;   // conserve le ratio
     float dw = sw * scale, dh = sh * scale;
     float dx = ((float)size - dw) / 2.0f, dy = ((float)size - dh) / 2.0f;
     g.DrawImage(src, dx, dy, dw, dh);
     delete src;
-    HICON h = NULL;
-    if (dest.GetHICON(&h) != Gdiplus::Ok) return NULL;
-    return h;
+    return b.ToIcon();
 }
 // Icone (40x40, taille des cartes) pour ce chemin, chargee et mise en cache
 // au premier appel ; un chemin vide ou illisible retombe sur l'icone par
@@ -477,12 +545,13 @@ static std::wstring DetectValheim() {
 //
 //   valmods.json
 //   {
-//     "version": 3,
+//     "version": 4,
 //     "valheimDir": "D:\\SteamLibrary\\steamapps\\common\\Valheim",
 //     "mods": [
 //       { "name": "...", "category": "...", "url": "...",
 //         "changelogUrl": "...", "dllPath": "...", "iconPath": "...",
-//         "tsVersion": "1.3.0", "lastCheck": "2026-08-19 14:30", "note": "..." }
+//         "tsVersion": "1.3.0", "description": "...",
+//         "lastCheck": "2026-08-19 14:30", "note": "..." }
 //     ]
 //   }
 static std::wstring DataFile()   { return ExeDir() + L"\\valmods.json"; }
@@ -491,7 +560,7 @@ static std::wstring LegacyFile() { return ExeDir() + L"\\valmods.tsv"; }
 static void SaveMods() {
     std::string out;
     out += "{\n";
-    out += "  \"version\": 3,\n";
+    out += "  \"version\": 4,\n";
     out += "  \"valheimDir\": " + mj::quote(W2U(g_valheimDir)) + ",\n";
     out += "  \"mods\": [\n";
     for (size_t i = 0; i < g_mods.size(); ++i) {
@@ -504,6 +573,7 @@ static void SaveMods() {
         out += "      \"dllPath\":      " + mj::quote(W2U(m.dllPath))      + ",\n";
         out += "      \"iconPath\":     " + mj::quote(W2U(m.iconPath))     + ",\n";
         out += "      \"tsVersion\":    " + mj::quote(W2U(m.tsVersion))    + ",\n";
+        out += "      \"description\":  " + mj::quote(W2U(m.description))  + ",\n";
         out += "      \"lastCheck\":    " + mj::quote(W2U(m.last))         + ",\n";
         out += "      \"note\":         " + mj::quote(W2U(m.note))         + "\n";
         out += (i + 1 < g_mods.size()) ? "    },\n" : "    }\n";
@@ -565,6 +635,7 @@ static void LoadData() {
                     m.dllPath      = Clean(U2W(v.s("dllPath")));
                     m.iconPath     = Clean(U2W(v.s("iconPath")));
                     m.tsVersion    = Clean(U2W(v.s("tsVersion")));
+                    m.description  = Clean(U2W(v.s("description")));
                     m.last         = Clean(U2W(v.s("lastCheck")));
                     m.note         = Clean(U2W(v.s("note")));
                     if (!m.name.empty() || !m.url.empty()) g_mods.push_back(m);
@@ -858,6 +929,7 @@ struct TsCheckResult {
     bool isThunderstore;  // le lien du mod pointait bien vers thunderstore.io
     bool deprecated;
     std::wstring latestVersion;
+    std::wstring description;
     std::wstring error;
     TsCheckResult() : ok(false), isThunderstore(false), deprecated(false) {}
 };
@@ -870,11 +942,13 @@ static TsCheckResult CheckThunderstoreVersion(const std::wstring& modUrl) {
     if (!f.ok) { r.error = f.error; return r; }
 
     std::wstring latest;
-    if (!FindLatestEntry(f.root, latest)) {
+    const mj::Value* bestEntry = FindLatestEntry(f.root, latest);
+    if (!bestEntry) {
         r.error = L"Numero de version introuvable dans la reponse (mod retire ou reponse degradee).";
         return r;
     }
     r.latestVersion = latest;
+    r.description = Clean(U2W(bestEntry->s("description")));
 
     const mj::Value* dep = f.root.find("is_deprecated");
     r.deprecated = (dep && dep->type == mj::BOOL && dep->b);
@@ -891,7 +965,7 @@ struct TsAutofillResult {
     bool ok;
     bool isThunderstore;
     std::wstring error;
-    std::wstring name, category, changelogUrl, latestVersion, localIconPath;
+    std::wstring name, category, changelogUrl, latestVersion, localIconPath, description;
     TsAutofillResult() : ok(false), isThunderstore(false) {}
 };
 static TsAutofillResult FetchThunderstoreAutofill(const std::wstring& modUrl) {
@@ -922,6 +996,10 @@ static TsAutofillResult FetchThunderstoreAutofill(const std::wstring& modUrl) {
         return r;
     }
     r.latestVersion = latest;
+    // Clean() aplatit les retours a la ligne en espaces : la description de
+    // Thunderstore est souvent un paragraphe, mais chaque carte n'en montre
+    // qu'une ligne tronquee de toute facon (voir RefillMods).
+    r.description = Clean(U2W(bestEntry->s("description")));
 
     std::wstring changelog = modUrl;
     if (!changelog.empty() && changelog[changelog.size() - 1] != L'/') changelog += L'/';
@@ -1036,7 +1114,7 @@ static void AddTip(HWND ctrl, const wchar_t* text);
 // ses propres boutons d'action - pas de toolbar partagee, pas de selection
 // au sens ListView. Le panneau (g_hCardsHost, classe "ValModsCards") gere
 // son propre defilement vertical (voir CardsHostProc plus bas).
-static const int CARD_H = 106;
+static const int CARD_H = 128;
 
 static void ClearCards() {
     for (size_t i = 0; i < g_cardChildren.size(); ++i)
@@ -1122,23 +1200,28 @@ static void RefillMods() {
         MkCardStatic(m.name, textX, y + 8, 400, 20,
             g_fontBold, 0, SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, true);
 
-        MkCardStatic(BuildDetailsLine(m), textX, y + 30, 400, 18,
+        // description courte (auto-remplie depuis Thunderstore, ou tapee a
+        // la main dans l'editeur) : ce que fait le mod, en un coup d'oeil.
+        MkCardStatic(m.description, textX, y + 28, 400, 18,
+            g_font, RGB(40, 40, 40), SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, true);
+
+        MkCardStatic(BuildDetailsLine(m), textX, y + 46, 400, 18,
             g_font, RowStatusColor(m), SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, true);
 
         std::wstring noteTxt = m.note.empty() ? L"" : (L"Note : " + m.note);
-        MkCardStatic(noteTxt, textX, y + 50, 400, 18,
+        MkCardStatic(noteTxt, textX, y + 64, 400, 18,
             g_font, RGB(120, 120, 120), SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, true);
 
-        int bx = textX, by = y + 72, bh = 24, gap = 4;
+        int bx = textX, by = y + 86, bh = 24, gap = 4;
         int id = RA_BASE + (int)i * RA_COUNT;
-        HWND bWatch = MkCardButton(id + RA_WATCH, L"Watch",  bx, by, 52, bh); bx += 52 + gap;
-        HWND bHist  = MkCardButton(id + RA_HIST,  L"Hist.",  bx, by, 44, bh); bx += 44 + gap;
-        HWND bCheck = MkCardButton(id + RA_CHECK, L"Check+", bx, by, 54, bh); bx += 54 + gap;
-        HWND bMark  = MkCardButton(id + RA_MARK,  L"OK",     bx, by, 36, bh); bx += 36 + gap;
-        HWND bTs    = MkCardButton(id + RA_TS,    L"TS",     bx, by, 34, bh); bx += 34 + gap;
-        HWND bDl    = MkCardButton(id + RA_DL,    L"DL",     bx, by, 34, bh); bx += 34 + gap;
-        HWND bEdit  = MkCardButton(id + RA_EDIT,  L"Modif.", bx, by, 50, bh); bx += 50 + gap;
-        HWND bMore  = MkCardButton(id + RA_MORE,  L"...",    bx, by, 30, bh); bx += 30 + gap;
+        HWND bWatch = MkCardButton(id + RA_WATCH, L"Watch",  bx, by, 58, bh); bx += 58 + gap;
+        HWND bHist  = MkCardButton(id + RA_HIST,  L"Hist.",  bx, by, 48, bh); bx += 48 + gap;
+        HWND bCheck = MkCardButton(id + RA_CHECK, L"Check+", bx, by, 60, bh); bx += 60 + gap;
+        HWND bMark  = MkCardButton(id + RA_MARK,  L"OK",     bx, by, 38, bh); bx += 38 + gap;
+        HWND bTs    = MkCardButton(id + RA_TS,    L"TS",     bx, by, 36, bh); bx += 36 + gap;
+        HWND bDl    = MkCardButton(id + RA_DL,    L"DL",     bx, by, 36, bh); bx += 36 + gap;
+        HWND bEdit  = MkCardButton(id + RA_EDIT,  L"Modif.", bx, by, 56, bh); bx += 56 + gap;
+        HWND bMore  = MkCardButton(id + RA_MORE,  L"...",    bx, by, 32, bh); bx += 32 + gap;
 
         AddTip(bWatch, L"Ouvre la page du mod dans le navigateur");
         AddTip(bHist,  L"Ouvre la page d'historique / changelog du mod");
@@ -1166,9 +1249,9 @@ static void RefillMods() {
 struct EditCtx {
     Mod m;
     bool ok;
-    HWND hName, hCat, hUrl, hHist, hDll, hIcon, hNote, hIconPreview;
+    HWND hName, hCat, hUrl, hHist, hDesc, hDll, hIcon, hNote, hIconPreview;
     HICON previewIcon;
-    EditCtx() : ok(false), hName(0), hCat(0), hUrl(0), hHist(0), hDll(0), hIcon(0),
+    EditCtx() : ok(false), hName(0), hCat(0), hUrl(0), hHist(0), hDesc(0), hDll(0), hIcon(0),
                 hNote(0), hIconPreview(0), previewIcon(0) {}
 };
 
@@ -1285,20 +1368,24 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         MkDlgButton(hwnd, IDC_E_BROWSEICON, L"Parcourir...", IX, 72, 130, 24);
         MkDlgButton(hwnd, IDC_E_CLEARICON,  L"Effacer",      IX, 100, 130, 24);
 
-        // -- DLL associe, pleine largeur -------------------------------------
-        MkLabel(hwnd, L"DLL installe (pour verifier qu'il est bien present)", LX, 232, LW + 16 + 130);
-        c->hDll = MkEdit(hwnd, c->m.dllPath, LX, 250, LW);
-        MkDlgButton(hwnd, IDC_E_BROWSEDLL, L"Parcourir...", LX + LW + 24, 250, 124, 24);
+        // -- description (courte, affichee sur la carte) - pleine largeur ---
+        MkLabel(hwnd, L"Description courte (affichee sur la carte)", LX, 232, LW + 16 + 130);
+        c->hDesc = MkEdit(hwnd, c->m.description, LX, 250, LW + 16 + 130);
 
-        MkLabel(hwnd, L"Note (version installee, remarques...)", LX, 280, LW + 16 + 130);
-        c->hNote = MkEdit(hwnd, c->m.note, LX, 298, LW + 16 + 130);
+        // -- DLL associe, pleine largeur -------------------------------------
+        MkLabel(hwnd, L"DLL installe (pour verifier qu'il est bien present)", LX, 282, LW + 16 + 130);
+        c->hDll = MkEdit(hwnd, c->m.dllPath, LX, 300, LW);
+        MkDlgButton(hwnd, IDC_E_BROWSEDLL, L"Parcourir...", LX + LW + 24, 300, 124, 24);
+
+        MkLabel(hwnd, L"Note (version installee, remarques...)", LX, 330, LW + 16 + 130);
+        c->hNote = MkEdit(hwnd, c->m.note, LX, 348, LW + 16 + 130);
 
         HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            336, 336, 92, 28, hwnd, (HMENU)IDOK, g_hInst, NULL);
+            336, 386, 92, 28, hwnd, (HMENU)IDOK, g_hInst, NULL);
         HWND ca = CreateWindowExW(0, L"BUTTON", L"Annuler",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            436, 336, 92, 28, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
+            436, 386, 92, 28, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
         SendMessageW(ok, WM_SETFONT, (WPARAM)g_font, TRUE);
         SendMessageW(ca, WM_SETFONT, (WPARAM)g_font, TRUE);
 
@@ -1338,6 +1425,7 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!r.name.empty())         SetWindowTextW(c->hName, r.name.c_str());
             if (!r.category.empty())     SetWindowTextW(c->hCat, r.category.c_str());
             if (!r.changelogUrl.empty()) SetWindowTextW(c->hHist, r.changelogUrl.c_str());
+            if (!r.description.empty())  SetWindowTextW(c->hDesc, r.description.c_str());
             if (!r.localIconPath.empty()) {
                 SetWindowTextW(c->hIcon, r.localIconPath.c_str());
                 UpdateIconPreview(c, r.localIconPath);
@@ -1384,6 +1472,7 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             c->m.cat  = Clean(GetTextOf(c->hCat));
             c->m.url  = u;
             c->m.changelogUrl = Clean(GetTextOf(c->hHist));
+            c->m.description  = Clean(GetTextOf(c->hDesc));
             c->m.dllPath      = Clean(GetTextOf(c->hDll));
             c->m.iconPath     = Clean(GetTextOf(c->hIcon));
             c->m.note = Clean(GetTextOf(c->hNote));
@@ -1419,7 +1508,7 @@ static bool ShowModEditor(HWND parent, const wchar_t* title, Mod& io) {
         reg = true;
     }
     EditCtx ctx; ctx.m = io;
-    RECT r = { 0, 0, 540, 380 };
+    RECT r = { 0, 0, 540, 430 };
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     AdjustWindowRect(&r, style, FALSE);
     RECT pr; GetWindowRect(parent, &pr);
@@ -1670,6 +1759,11 @@ static void ActionCheckThunderstore(HWND hwnd, int idx) {
     for (size_t k = 0; k < g_mods.size(); ++k) {
         if (g_mods[k].name == name) {
             g_mods[k].tsVersion = r.latestVersion;
+            // bonus non-destructif : on ne remplit la description que si
+            // elle est vide, contrairement a Auto-remplir qui l'ecrase
+            // toujours (ici ce n'est pas l'action demandee explicitement).
+            if (g_mods[k].description.empty() && !r.description.empty())
+                g_mods[k].description = r.description;
             g_mods[k].last = NowStamp();   // une verification en ligne compte comme une verification
             SaveMods();
             RefillMods();
@@ -2084,21 +2178,15 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int cid = LOWORD(wp);
 
         // boutons dynamiques d'une carte de mod (voir RA_BASE/RA_COUNT) :
-        // id = RA_BASE + index_ligne * RA_COUNT + action.
+        // id = RA_BASE + index_ligne * RA_COUNT + action. On POSTE l'action
+        // (voir le commentaire pres de WM_APP_ROWACTION) sauf "..." qui se
+        // contente d'ouvrir un menu et ne detruit aucune fenetre.
         if (cid >= RA_BASE) {
             int raw = cid - RA_BASE;
             int action = raw % RA_COUNT;
             int rowIdx = raw / RA_COUNT;
-            switch (action) {
-                case RA_WATCH: ActionOpen(hwnd, rowIdx, false);        break;
-                case RA_HIST:  ActionOpenHistory(hwnd, rowIdx);        break;
-                case RA_CHECK: ActionOpen(hwnd, rowIdx, true);         break;
-                case RA_MARK:  ActionMark(hwnd, rowIdx);               break;
-                case RA_TS:    ActionCheckThunderstore(hwnd, rowIdx);  break;
-                case RA_DL:    ActionDownloadLatest(hwnd, rowIdx);     break;
-                case RA_EDIT:  ActionEdit(hwnd, rowIdx);               break;
-                case RA_MORE:  ShowRowOverflowMenu(hwnd, rowIdx);      break;
-            }
+            if (action == RA_MORE) ShowRowOverflowMenu(hwnd, rowIdx);
+            else PostMessageW(hwnd, WM_APP_ROWACTION, (WPARAM)action, (LPARAM)rowIdx);
             return 0;
         }
         if (cid == IDC_SORTCOMBO && HIWORD(wp) == CBN_SELCHANGE) {
@@ -2117,11 +2205,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RefillMods();
             return 0;
 
-        // menu "..." d'une carte (actions moins frequentes)
-        case IDM_CTX_LOCATE_DLL:  ActionLocateDll(hwnd, g_ctxMenuModIndex);   return 0;
-        case IDM_CTX_OPEN_DLLDIR: ActionOpenDllDir(hwnd, g_ctxMenuModIndex);  return 0;
-        case IDM_CTX_COPY:        ActionCopy(hwnd, g_ctxMenuModIndex);       return 0;
-        case IDM_CTX_DELETE:      ActionDelete(hwnd, g_ctxMenuModIndex);     return 0;
+        // menu "..." d'une carte (actions moins frequentes) - egalement
+        // POSTEES : le menu a ete ouvert depuis un bouton de carte, on est
+        // donc toujours dans la meme pile d'appels imbriquee que ci-dessus.
+        case IDM_CTX_LOCATE_DLL:  PostMessageW(hwnd, WM_APP_ROWACTION, RA_MENU_LOCATE_DLL, g_ctxMenuModIndex);  return 0;
+        case IDM_CTX_OPEN_DLLDIR: PostMessageW(hwnd, WM_APP_ROWACTION, RA_MENU_OPEN_DLLDIR, g_ctxMenuModIndex); return 0;
+        case IDM_CTX_COPY:        PostMessageW(hwnd, WM_APP_ROWACTION, RA_MENU_COPY, g_ctxMenuModIndex);        return 0;
+        case IDM_CTX_DELETE:      PostMessageW(hwnd, WM_APP_ROWACTION, RA_MENU_DELETE, g_ctxMenuModIndex);      return 0;
 
         case IDC_BREFRESH:  RefreshSaves(); return 0;
         case IDC_BOPENSAVE: OpenFolder(hwnd, SavesRoot(), L"sauvegardes"); return 0;
@@ -2165,8 +2255,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 L"derniere version publiee (uniquement pour les mods heberges sur\n"
                 L"thunderstore.io - Nexus/GitHub ne sont pas geres).\n\n"
                 L"Dans l'editeur, Auto-remplir depuis Thunderstore recupere le nom, la\n"
-                L"categorie, le lien historique, la derniere version et l'icone du mod\n"
-                L"a partir du lien colle (meme limite : Thunderstore uniquement).\n\n"
+                L"categorie, le lien historique, la description, la derniere version et\n"
+                L"l'icone du mod a partir du lien colle (meme limite : Thunderstore\n"
+                L"uniquement). Verif. TS complete aussi la description si elle est vide.\n\n"
                 L"Telecharger (DL) propose une boite Enregistrer sous - a extraire\n"
                 L"toi-meme dans BepInEx\\plugins, rien n'est installe automatiquement.\n\n"
                 L"Donnees : valmods.json, a cote de l'exe.";
@@ -2175,6 +2266,29 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         }
         break;
+    }
+
+    // Execution reelle, differee, des actions de carte (voir le commentaire
+    // pres de WM_APP_ROWACTION) : on est ici sur une iteration de boucle de
+    // messages fraiche, plus aucun bouton n'est en train de se traiter -
+    // RefillMods() peut detruire/recreer les cartes sans risque.
+    case WM_APP_ROWACTION: {
+        int action = (int)wp;
+        int idx = (int)lp;
+        switch (action) {
+            case RA_WATCH: ActionOpen(hwnd, idx, false);        break;
+            case RA_HIST:  ActionOpenHistory(hwnd, idx);        break;
+            case RA_CHECK: ActionOpen(hwnd, idx, true);         break;
+            case RA_MARK:  ActionMark(hwnd, idx);               break;
+            case RA_TS:    ActionCheckThunderstore(hwnd, idx);  break;
+            case RA_DL:    ActionDownloadLatest(hwnd, idx);     break;
+            case RA_EDIT:  ActionEdit(hwnd, idx);               break;
+            case RA_MENU_COPY:        ActionCopy(hwnd, idx);        break;
+            case RA_MENU_LOCATE_DLL:  ActionLocateDll(hwnd, idx);   break;
+            case RA_MENU_OPEN_DLLDIR: ActionOpenDllDir(hwnd, idx);  break;
+            case RA_MENU_DELETE:      ActionDelete(hwnd, idx);      break;
+        }
+        return 0;
     }
 
     case WM_NOTIFY: {

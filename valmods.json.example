@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "valheimDir": "",
   "mods": [
     {
@@ -10,6 +10,7 @@
       "dllPath": "",
       "iconPath": "",
       "tsVersion": "",
+      "description": "BepInEx pack for Valheim. Preconfigured, unstripped Unity DLLs.",
       "lastCheck": "",
       "note": "Supprime cette ligne, c'est juste un exemple."
     }

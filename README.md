@@ -26,16 +26,20 @@ l'appli se contente de retenir tes liens et la date où tu les as vérifiés.
     (DLL manquant ou mise à jour disponible), orange si la dernière
     vérification date de 14+ jours, vert si tout va bien, gris si jamais
     vérifié
+  - Chaque carte affiche aussi une **description courte** (auto-remplie
+    depuis Thunderstore, ou tapée à la main dans l'éditeur)
   - Icône par mod : PNG/JPG/BMP/ICO/GIF, choisie via un sélecteur de fichier
     dans l'éditeur (aperçu affiché), ou récupérée automatiquement (voir
     Auto-remplir ci-dessous)
   - **Auto-remplir depuis Thunderstore** (dans l'éditeur) : à partir du lien
-    du mod, récupère nom, catégorie, lien historique, dernière version et
-    icône (téléchargée dans `icons/` à côté de l'exe). Ne remplace jamais le
-    chemin du DLL installé, qui reste propre à ta machine.
+    du mod, récupère nom, catégorie, lien historique, description, dernière
+    version et icône (téléchargée dans `icons/` à côté de l'exe). Ne
+    remplace jamais le chemin du DLL installé, qui reste propre à ta
+    machine.
   - **TS** interroge l'API publique de Thunderstore (aucune clé requise) pour
     connaître la dernière version publiée d'un mod, et la compare à la
-    version lue dans le DLL installé. Ne fonctionne que pour les mods dont
+    version lue dans le DLL installé (et complète la description si elle
+    est encore vide). Ne fonctionne que pour les mods dont
     le lien pointe vers `thunderstore.io` (Nexus/GitHub n'ont pas
     d'équivalent aussi simple sans clé d'API). L'appel réseau est synchrone
     et déclenché mod par mod sur clic explicite — pas de vérification
@@ -104,7 +108,7 @@ release GitHub.
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "valheimDir": "D:\\SteamLibrary\\steamapps\\common\\Valheim",
   "mods": [
     {
@@ -115,6 +119,7 @@ release GitHub.
       "dllPath": "D:\\...\\BepInEx\\plugins\\ValheimPlus.dll",
       "iconPath": "C:\\Users\\...\\Pictures\\valheimplus.png",
       "tsVersion": "0.9.9.16",
+      "description": "QoL and building overhaul for Valheim.",
       "lastCheck": "2026-08-19 14:30",
       "note": "v0.9.9.16"
     }
@@ -123,8 +128,8 @@ release GitHub.
 ```
 
 Un fichier `valmods.json` plus ancien (sans `changelogUrl`/`dllPath`/
-`iconPath`/`tsVersion`) reste lisible tel quel : les champs manquants sont
-simplement traités comme vides.
+`iconPath`/`tsVersion`/`description`) reste lisible tel quel : les champs
+manquants sont simplement traités comme vides.
 
 Fichier texte, éditable à la main. `valmods.json` n'est volontairement pas
 versionné (voir `.gitignore`) : c'est ta liste personnelle, pas un fichier
