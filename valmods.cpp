@@ -1241,7 +1241,8 @@ static void RefillMods() {
 
     if (g_hCardsHost) {
         SendMessageW(g_hCardsHost, WM_SETREDRAW, TRUE, 0);
-        InvalidateRect(g_hCardsHost, NULL, TRUE);
+        RedrawWindow(g_hCardsHost, NULL, NULL,
+            RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
     }
 }
 
@@ -1632,11 +1633,22 @@ static void BackupSelection(HWND hwnd) {
 // Chaque action prend l'index du mod concerne EXPLICITEMENT (idx), passe par
 // le bouton de la carte qui l'a declenchee - il n'y a plus de "selection"
 // au sens ListView depuis le passage a la vue en cartes.
+static void UpdateTitle();
+
 static bool ValidMod(HWND hwnd, int idx) {
     if (idx >= 0 && idx < (int)g_mods.size()) return true;
     Info(hwnd, L"Ce mod n'est plus dans la liste (elle a change entre-temps).");
     return false;
 }
+static void RefreshModsUI() {
+    RefreshModsUI();
+    UpdateTitle();
+    if (g_hCardsHost) {
+        RedrawWindow(g_hCardsHost, NULL, NULL,
+            RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    }
+}
+
 static void ActionOpen(HWND hwnd, int idx, bool stamp) {
     if (!ValidMod(hwnd, idx)) return;
     std::wstring url = g_mods[idx].url;
@@ -1645,14 +1657,14 @@ static void ActionOpen(HWND hwnd, int idx, bool stamp) {
     if (stamp) {
         g_mods[idx].last = NowStamp();
         SaveMods();
-        RefillMods();
+        RefreshModsUI();
     }
 }
 static void ActionMark(HWND hwnd, int idx) {
     if (!ValidMod(hwnd, idx)) return;
     g_mods[idx].last = NowStamp();
     SaveMods();
-    RefillMods();
+    RefreshModsUI();
 }
 static void ActionAdd(HWND hwnd) {
     Mod m;
@@ -1661,7 +1673,7 @@ static void ActionAdd(HWND hwnd) {
     if (ShowModEditor(hwnd, L"Ajouter un mod", m)) {
         g_mods.push_back(m);
         SaveMods();
-        RefillMods();
+        RefreshModsUI();
     }
 }
 static void ActionEdit(HWND hwnd, int idx) {
@@ -1670,7 +1682,7 @@ static void ActionEdit(HWND hwnd, int idx) {
     if (ShowModEditor(hwnd, L"Modifier le mod", m)) {
         g_mods[idx] = m;
         SaveMods();
-        RefillMods();
+        RefreshModsUI();
     }
 }
 static void ActionDelete(HWND hwnd, int idx) {
@@ -1680,7 +1692,7 @@ static void ActionDelete(HWND hwnd, int idx) {
     if (MessageBoxW(hwnd, q.c_str(), L"ValMods", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
     g_mods.erase(g_mods.begin() + idx);
     SaveMods();
-    RefillMods();
+    RefreshModsUI();
 }
 static void ActionCopy(HWND hwnd, int idx) {
     if (!ValidMod(hwnd, idx)) return;
