@@ -1,6 +1,10 @@
 {
-  "version": 4,
+  "version": 10,
   "valheimDir": "",
+  "lastGlobalCheck": "",
+  "showValheim10Check": true,
+  "modpackFilter": "",
+  "hideUpToDate": false,
   "mods": [
     {
       "name": "Exemple - BepInExPack Valheim",
@@ -10,7 +14,11 @@
       "dllPath": "",
       "iconPath": "",
       "tsVersion": "",
+      "tsLatestDate": "",
+      "installedVersion": "",
       "description": "BepInEx pack for Valheim. Preconfigured, unstripped Unity DLLs.",
+      "modpack": "",
+      "nonThunderstore": false,
       "lastCheck": "",
       "note": "Supprime cette ligne, c'est juste un exemple."
     }

@@ -73,6 +73,11 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_BADD       1002
 #define IDC_SORTCOMBO  1018
 #define IDC_SORTDIR    1019
+#define IDC_CHECKALL   1020
+#define IDC_DLALL      1021
+#define IDC_SHOW10     1022
+#define IDC_MODPACK    1023
+#define IDC_HIDEUPTODATE 1024
 #define IDC_WORLDS     1010
 #define IDC_CHARS      1011
 #define IDC_LBL1       1012
@@ -129,6 +134,8 @@ enum { RA_MENU_COPY = 100, RA_MENU_LOCATE_DLL = 101, RA_MENU_OPEN_DLLDIR = 102, 
 #define IDC_E_BROWSEICON  3002
 #define IDC_E_CLEARICON   3003
 #define IDC_E_AUTOFILL    3004
+#define IDC_E_NONTS       3005
+#define IDC_E_MODPACK     3006
 
 #define VALMODS_VERSION "1.2.0"
 
@@ -140,6 +147,31 @@ enum { COL_NAME = 0, COL_CAT = 1, COL_LASTCHECK = 2, COL_AGE = 3,
 // ---------------------------------------------------------------- donnees
 struct Mod {
     std::wstring name, cat, url, changelogUrl, dllPath, iconPath, tsVersion, description, last, note;
+    // Date de publication (ISO8601, telle que renvoyee par Thunderstore) de
+    // la derniere version connue - sert a comparer avec la sortie de la 1.0
+    // de Valheim (voir VALHEIM_10_DATE). Distincte de "last" (date a
+    // laquelle NOUS avons verifie), c'est la date a laquelle LE MOD a ete
+    // publie.
+    std::wstring tsLatestDate;
+    // Version qu'ON SUIT comme etant celle installee - mise a jour
+    // automatiquement par Telecharger/Tout DL (on suppose que le zip va
+    // etre extrait), et editable a la main dans l'editeur. Distincte de la
+    // version EMBARQUEE dans le fichier DLL (voir GetDllVersionString) :
+    // beaucoup de DLL de mods Unity/BepInEx n'ont pas de ressource de
+    // version fiable, donc "Tout verifier" et le statut affiche sur la
+    // carte s'appuient sur CE champ en priorite (voir
+    // GetEffectiveInstalledVersion), avec repli sur la version DLL
+    // uniquement si ce champ est vide.
+    std::wstring installedVersion;
+    // Regroupe des mods pour un meme playthrough/serveur ("modpack") ; vide
+    // = pas assigne. Sert de filtre d'affichage et pour "Tout verifier" /
+    // "Tout DL" (voir g_modpackFilter).
+    std::wstring modpack;
+    // Coche explicite : masque TS/DL sur la carte et exclut ce mod du
+    // "Tout verifier", quel que soit ce que l'URL laisserait deviner (utile
+    // pour un mod Nexus/GitHub dont le lien ne serait pas reconnaissable).
+    bool nonThunderstore;
+    Mod() : nonThunderstore(false) {}
 };
 
 static HINSTANCE g_hInst = NULL;
@@ -150,6 +182,34 @@ static HWND  g_hTooltip = NULL;
 static HFONT g_font = NULL, g_fontBold = NULL;
 static std::vector<Mod> g_mods;
 static std::wstring g_valheimDir;
+// Date du dernier "Tout verifier", distincte de la date individuelle de
+// chaque mod : le bulk check ne doit JAMAIS toucher au champ "last" propre
+// a un mod (qui reste reserve a une verification personnelle, manuelle -
+// c'est ce qui alimente le code couleur base sur l'anciennete). Persistee a
+// part dans le JSON, jamais melangee aux dates par mod.
+static std::wstring g_lastGlobalCheck;
+// Active/desactive l'affichage de l'indicateur "1.0" sur les cartes. Coche
+// par defaut (voir wWinMain), mais desactivable en un clic : juste apres la
+// sortie de la 1.0, les mods ne vont pas tous se mettre a jour instantanement
+// (il faut le temps que les moddeurs s'y mettent), donc l'indicateur
+// passerait au orange presque partout sans que ce soit vraiment un
+// probleme - le toggle permet d'eteindre ce bruit le temps que l'ecosysteme
+// rattrape son retard, puis de le rallumer plus tard.
+static bool g_showValheim10 = true;
+// Filtre d'affichage par "modpack" : vide = tous les mods, sinon ne montre
+// que ceux dont Mod::modpack correspond exactement. Persiste (voir JSON).
+static std::wstring g_modpackFilter;
+// Masque les mods dont le statut Thunderstore est "a jour" (vert) de
+// l'affichage ET de "Tout DL" (mais PAS de "Tout verifier", dont le but est
+// justement de decouvrir si le statut a change - le masquer la rendrait
+// contre-productif). Voir ModPassesFilters/ModMatchesPack.
+static bool g_hideUpToDate = false;
+// Traduit une position de ligne VISIBLE (0, 1, 2... dans l'ordre des cartes
+// effectivement affichees) vers son vrai index dans g_mods. Necessaire des
+// qu'un filtre peut faire sauter des mods : sans ca, les boutons de carte
+// (qui encodent RA_BASE + position*RA_COUNT) cibleraient le mauvais mod.
+// Reconstruit a chaque RefillMods().
+static std::vector<int> g_visibleIndices;
 static int  g_sortCol = 0;
 static bool g_sortAsc = true;
 static bool g_lastListIsWorld = true;   // pour le bouton backup
@@ -342,6 +402,11 @@ static HICON MakeDefaultIcon(int size) {
     AlphaIconBuilder b(size);
     if (!b.ok()) return NULL;
     Gdiplus::Graphics g(b.gdiBmp);
+    // SourceCopy plutot que le SourceOver par defaut : remplace les pixels
+    // au lieu de les meler a un fond deja transparent - ecarte tout risque
+    // de mauvaise propagation du canal alpha sur une surface PARGB (voir
+    // le meme choix, plus critique, dans LoadScaledIconFromFile).
+    g.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     Gdiplus::SolidBrush fill(Gdiplus::Color(255, 100, 100, 112));
     Gdiplus::Pen pen(Gdiplus::Color(255, 60, 60, 70), 1.0f);
@@ -361,6 +426,13 @@ static HICON LoadScaledIconFromFile(const std::wstring& path, int size) {
     AlphaIconBuilder b(size);
     if (!b.ok()) { delete src; return NULL; }
     Gdiplus::Graphics g(b.gdiBmp);
+    // Cf. MakeDefaultIcon : SourceCopy est ici encore plus important, car
+    // DrawImage (avec redimensionnement) est plus expose que de simples
+    // remplissages a une mauvaise gestion de l'alpha en mode "over" par
+    // certaines versions de GDI+ - c'est le suspect le plus probable pour
+    // une icone chargee qui reste invisible/transparente alors que l'icone
+    // par defaut (simples formes pleines) s'affiche correctement.
+    g.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
     g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     float sw = (float)src->GetWidth(), sh = (float)src->GetHeight();
@@ -545,12 +617,19 @@ static std::wstring DetectValheim() {
 //
 //   valmods.json
 //   {
-//     "version": 4,
+//     "version": 10,
 //     "valheimDir": "D:\\SteamLibrary\\steamapps\\common\\Valheim",
+//     "lastGlobalCheck": "2026-08-19 14:30",
+//     "showValheim10Check": true,
+//     "modpackFilter": "",
+//     "hideUpToDate": false,
 //     "mods": [
 //       { "name": "...", "category": "...", "url": "...",
 //         "changelogUrl": "...", "dllPath": "...", "iconPath": "...",
-//         "tsVersion": "1.3.0", "description": "...",
+//         "tsVersion": "1.3.0", "tsLatestDate": "2026-03-26T21:26:57Z",
+//         "installedVersion": "1.3.0",
+//         "description": "...", "modpack": "Serveur du vendredi",
+//         "nonThunderstore": false,
 //         "lastCheck": "2026-08-19 14:30", "note": "..." }
 //     ]
 //   }
@@ -560,22 +639,30 @@ static std::wstring LegacyFile() { return ExeDir() + L"\\valmods.tsv"; }
 static void SaveMods() {
     std::string out;
     out += "{\n";
-    out += "  \"version\": 4,\n";
+    out += "  \"version\": 10,\n";
     out += "  \"valheimDir\": " + mj::quote(W2U(g_valheimDir)) + ",\n";
+    out += "  \"lastGlobalCheck\": " + mj::quote(W2U(g_lastGlobalCheck)) + ",\n";
+    out += std::string("  \"showValheim10Check\": ") + (g_showValheim10 ? "true" : "false") + ",\n";
+    out += "  \"modpackFilter\": " + mj::quote(W2U(g_modpackFilter)) + ",\n";
+    out += std::string("  \"hideUpToDate\": ") + (g_hideUpToDate ? "true" : "false") + ",\n";
     out += "  \"mods\": [\n";
     for (size_t i = 0; i < g_mods.size(); ++i) {
         const Mod& m = g_mods[i];
         out += "    {\n";
-        out += "      \"name\":         " + mj::quote(W2U(m.name))         + ",\n";
-        out += "      \"category\":     " + mj::quote(W2U(m.cat))          + ",\n";
-        out += "      \"url\":          " + mj::quote(W2U(m.url))          + ",\n";
-        out += "      \"changelogUrl\": " + mj::quote(W2U(m.changelogUrl)) + ",\n";
-        out += "      \"dllPath\":      " + mj::quote(W2U(m.dllPath))      + ",\n";
-        out += "      \"iconPath\":     " + mj::quote(W2U(m.iconPath))     + ",\n";
-        out += "      \"tsVersion\":    " + mj::quote(W2U(m.tsVersion))    + ",\n";
-        out += "      \"description\":  " + mj::quote(W2U(m.description))  + ",\n";
-        out += "      \"lastCheck\":    " + mj::quote(W2U(m.last))         + ",\n";
-        out += "      \"note\":         " + mj::quote(W2U(m.note))         + "\n";
+        out += "      \"name\":             " + mj::quote(W2U(m.name))             + ",\n";
+        out += "      \"category\":         " + mj::quote(W2U(m.cat))              + ",\n";
+        out += "      \"url\":              " + mj::quote(W2U(m.url))              + ",\n";
+        out += "      \"changelogUrl\":     " + mj::quote(W2U(m.changelogUrl))     + ",\n";
+        out += "      \"dllPath\":          " + mj::quote(W2U(m.dllPath))          + ",\n";
+        out += "      \"iconPath\":         " + mj::quote(W2U(m.iconPath))         + ",\n";
+        out += "      \"tsVersion\":        " + mj::quote(W2U(m.tsVersion))        + ",\n";
+        out += "      \"tsLatestDate\":     " + mj::quote(W2U(m.tsLatestDate))     + ",\n";
+        out += "      \"installedVersion\": " + mj::quote(W2U(m.installedVersion)) + ",\n";
+        out += "      \"description\":      " + mj::quote(W2U(m.description))      + ",\n";
+        out += "      \"modpack\":          " + mj::quote(W2U(m.modpack))          + ",\n";
+        out += std::string("      \"nonThunderstore\": ") + (m.nonThunderstore ? "true" : "false") + ",\n";
+        out += "      \"lastCheck\":        " + mj::quote(W2U(m.last))             + ",\n";
+        out += "      \"note\":             " + mj::quote(W2U(m.note))             + "\n";
         out += (i + 1 < g_mods.size()) ? "    },\n" : "    }\n";
     }
     out += "  ]\n";
@@ -622,6 +709,12 @@ static void LoadData() {
         mj::Value root;
         if (mj::parse(raw, root) && root.type == mj::OBJ) {
             g_valheimDir = U2W(root.s("valheimDir"));
+            g_lastGlobalCheck = U2W(root.s("lastGlobalCheck"));
+            const mj::Value* show10 = root.find("showValheim10Check");
+            g_showValheim10 = (show10 && show10->type == mj::BOOL) ? show10->b : true;
+            g_modpackFilter = U2W(root.s("modpackFilter"));
+            const mj::Value* hideUp = root.find("hideUpToDate");
+            g_hideUpToDate = (hideUp && hideUp->type == mj::BOOL && hideUp->b);
             const mj::Value* mods = root.find("mods");
             if (mods && mods->type == mj::ARR) {
                 for (size_t i = 0; i < mods->arr.size(); ++i) {
@@ -635,7 +728,12 @@ static void LoadData() {
                     m.dllPath      = Clean(U2W(v.s("dllPath")));
                     m.iconPath     = Clean(U2W(v.s("iconPath")));
                     m.tsVersion    = Clean(U2W(v.s("tsVersion")));
+                    m.tsLatestDate = Clean(U2W(v.s("tsLatestDate")));
+                    m.installedVersion = Clean(U2W(v.s("installedVersion")));
                     m.description  = Clean(U2W(v.s("description")));
+                    m.modpack      = Clean(U2W(v.s("modpack")));
+                    const mj::Value* nts = v.find("nonThunderstore");
+                    m.nonThunderstore = (nts && nts->type == mj::BOOL && nts->b);
                     m.last         = Clean(U2W(v.s("lastCheck")));
                     m.note         = Clean(U2W(v.s("note")));
                     if (!m.name.empty() || !m.url.empty()) g_mods.push_back(m);
@@ -703,6 +801,18 @@ static std::wstring GetDllVersionString(const std::wstring& path) {
         HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS));
     return out;
 }
+// Version consideree comme "installee", pour toutes les comparaisons
+// (statut affiche sur la carte, "Tout verifier") : priorite a
+// Mod::installedVersion (suivie explicitement, mise a jour par
+// Telecharger/Tout DL ou modifiee a la main), repli sur la version
+// EMBARQUEE dans le fichier DLL seulement si ce champ est vide - beaucoup
+// de DLL de mods Unity/BepInEx n'ont pas de ressource de version fiable,
+// donc s'appuyer uniquement dessus donnait des faux "jamais verifie".
+static std::wstring GetEffectiveInstalledVersion(const Mod& m) {
+    if (!m.installedVersion.empty()) return m.installedVersion;
+    if (m.dllPath.empty()) return L"";
+    return GetDllVersionString(m.dllPath);
+}
 // missingOut, si fourni, est mis a true si un DLL est renseigne mais introuvable
 static std::wstring DllStatusText(const Mod& m, bool* missingOut) {
     if (missingOut) *missingOut = false;
@@ -712,7 +822,7 @@ static std::wstring DllStatusText(const Mod& m, bool* missingOut) {
         if (missingOut) *missingOut = true;
         return L"manquant : " + fn;
     }
-    std::wstring ver = GetDllVersionString(m.dllPath);
+    std::wstring ver = GetEffectiveInstalledVersion(m);
     return ver.empty() ? fn : (fn + L" (v" + ver + L")");
 }
 
@@ -929,6 +1039,7 @@ struct TsCheckResult {
     bool isThunderstore;  // le lien du mod pointait bien vers thunderstore.io
     bool deprecated;
     std::wstring latestVersion;
+    std::wstring latestDate;   // date_created (ISO8601) de la derniere version
     std::wstring description;
     std::wstring error;
     TsCheckResult() : ok(false), isThunderstore(false), deprecated(false) {}
@@ -949,6 +1060,7 @@ static TsCheckResult CheckThunderstoreVersion(const std::wstring& modUrl) {
     }
     r.latestVersion = latest;
     r.description = Clean(U2W(bestEntry->s("description")));
+    r.latestDate = Clean(U2W(bestEntry->s("date_created")));
 
     const mj::Value* dep = f.root.find("is_deprecated");
     r.deprecated = (dep && dep->type == mj::BOOL && dep->b);
@@ -965,7 +1077,7 @@ struct TsAutofillResult {
     bool ok;
     bool isThunderstore;
     std::wstring error;
-    std::wstring name, category, changelogUrl, latestVersion, localIconPath, description;
+    std::wstring name, category, changelogUrl, latestVersion, latestDate, localIconPath, description;
     TsAutofillResult() : ok(false), isThunderstore(false) {}
 };
 static TsAutofillResult FetchThunderstoreAutofill(const std::wstring& modUrl) {
@@ -996,6 +1108,7 @@ static TsAutofillResult FetchThunderstoreAutofill(const std::wstring& modUrl) {
         return r;
     }
     r.latestVersion = latest;
+    r.latestDate = Clean(U2W(bestEntry->s("date_created")));
     // Clean() aplatit les retours a la ligne en espaces : la description de
     // Thunderstore est souvent un paragraphe, mais chaque carte n'en montre
     // qu'une ligne tronquee de toute facon (voir RefillMods).
@@ -1066,7 +1179,7 @@ static bool DownloadThunderstoreZip(const std::wstring& ns, const std::wstring& 
 static std::wstring TsStatusText(const Mod& m, int* colorCategory) {
     if (colorCategory) *colorCategory = 0;
     if (m.tsVersion.empty()) return L"-";
-    std::wstring installed = m.dllPath.empty() ? L"" : GetDllVersionString(m.dllPath);
+    std::wstring installed = GetEffectiveInstalledVersion(m);
     if (installed.empty()) return m.tsVersion;   // derniere version connue, mais rien a comparer
     if (VersionLess(installed, m.tsVersion)) {
         if (colorCategory) *colorCategory = 2;
@@ -1074,6 +1187,39 @@ static std::wstring TsStatusText(const Mod& m, int* colorCategory) {
     }
     if (colorCategory) *colorCategory = 1;
     return m.tsVersion + L" (a jour)";
+}
+
+// Sortie de la version 1.0 de Valheim (mise a jour "Deep North"), annoncee
+// le 7 juin 2026 pour une sortie le 9 septembre 2026 - a verifier/ajuster
+// si la date venait a changer. Format AAAA-MM-JJ pour rester directement
+// comparable (lexicographiquement) aux horodatages ISO8601/"AAAA-MM-JJ ..."
+// utilises partout ailleurs dans ce fichier.
+static const wchar_t* VALHEIM_10_DATE = L"2026-09-09";
+
+// Ne garde que la partie AAAA-MM-JJ d'un horodatage ISO8601
+// ("2026-03-26T21:26:57Z") ou de notre propre format ("2026-03-26 14:30").
+static std::wstring DatePrefix(const std::wstring& stamp) {
+    return stamp.size() >= 10 ? stamp.substr(0, 10) : stamp;
+}
+// Categorie de couleur : 0 gris (inconnu - jamais verifie), 1 vert (mis a
+// jour depuis la sortie de la 1.0), 2 gris neutre (pas encore mis a jour,
+// mais la 1.0 n'est elle-meme pas encore sortie - rien d'anormal), 3 orange
+// (la 1.0 est sortie et ce mod n'a pas ete mis a jour depuis - a surveiller).
+static std::wstring Valheim10StatusText(const Mod& m, int* colorCategory) {
+    if (colorCategory) *colorCategory = 0;
+    if (m.tsLatestDate.empty()) return L"1.0 : inconnu";
+    std::wstring modDate = DatePrefix(m.tsLatestDate);
+    if (modDate >= VALHEIM_10_DATE) {
+        if (colorCategory) *colorCategory = 1;
+        return L"1.0 : a jour";
+    }
+    std::wstring today = DatePrefix(NowStamp());
+    if (today < VALHEIM_10_DATE) {
+        if (colorCategory) *colorCategory = 2;
+        return L"1.0 : pas encore sortie";
+    }
+    if (colorCategory) *colorCategory = 3;
+    return L"1.0 : a verifier";
 }
 
 // Une seule couleur "dominante" par carte plutot que par segment : plus
@@ -1100,6 +1246,7 @@ static std::wstring BuildDetailsLine(const Mod& m) {
     s += L"Verif : " + (m.last.empty() ? std::wstring(L"jamais") : DaysText(m.last));
     s += L"  |  DLL : " + DllStatusText(m, NULL);
     s += L"  |  TS : " + TsStatusText(m, NULL);
+    if (g_showValheim10) s += L"  |  " + Valheim10StatusText(m, NULL);
     return s;
 }
 
@@ -1128,8 +1275,11 @@ static void ClearCards() {
 static HWND MkCardStatic(const std::wstring& txt, int x, int y, int w, int h,
                          HFONT font, COLORREF color, DWORD extraStyle, bool stretch)
 {
+    // WS_CLIPSIBLINGS : indispensable avec autant de controles freres dans
+    // un meme parent - sans lui, un frere peut se retrouver mal exclu de la
+    // zone de rafraichissement d'un autre au moment de peindre.
     HWND s = CreateWindowExW(0, L"STATIC", txt.c_str(),
-        WS_CHILD | WS_VISIBLE | SS_NOPREFIX | extraStyle,
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX | extraStyle,
         x, y, w, h, g_hCardsHost, NULL, g_hInst, NULL);
     SendMessageW(s, WM_SETFONT, (WPARAM)font, TRUE);
     if (color) SetWindowLongPtrW(s, GWLP_USERDATA, (LONG_PTR)color);
@@ -1139,7 +1289,7 @@ static HWND MkCardStatic(const std::wstring& txt, int x, int y, int w, int h,
 }
 static HWND MkCardButton(int id, const wchar_t* txt, int x, int y, int w, int h) {
     HWND b = CreateWindowExW(0, L"BUTTON", txt,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_PUSHBUTTON,
         x, y, w, h, g_hCardsHost, (HMENU)(INT_PTR)id, g_hInst, NULL);
     SendMessageW(b, WM_SETFONT, (WPARAM)g_font, TRUE);
     CardChild cc; cc.hwnd = b; cc.x = x; cc.y = y; cc.w = w; cc.h = h; cc.stretch = false;
@@ -1163,6 +1313,30 @@ static void RepositionCards() {
         MoveWindow(cc.hwnd, cc.x, cc.y - g_scrollPos, w, cc.h, TRUE);
     }
 }
+// InvalidateRect+UpdateWindow ne force le repaint QUE de g_hCardsHost
+// lui-meme, jamais de ses enfants - or le contenu reel des cartes (icones,
+// textes, boutons) est entierement porte par ces enfants, le panneau n'a
+// aucun contenu propre a peindre. RDW_ALLCHILDREN est indispensable pour
+// que la mise a jour se propage vraiment jusqu'a eux ; sans ca, seul un
+// evenement systeme qui invalide tout de lui-meme (comme un redimensionnement,
+// via CS_HREDRAW|CS_VREDRAW) declenche un affichage correct.
+static void RedrawCardsHost() {
+    if (!g_hCardsHost) return;
+    RedrawWindow(g_hCardsHost, NULL, NULL,
+        RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_ERASE);
+}
+// Meme constat, mais pour toute la fenetre : certains controles enfants
+// directs de la fenetre principale (le menu de tri, les boutons Ajouter/
+// Croissant...) peuvent eux aussi ne pas se redessiner correctement apres
+// une action, exactement pour la meme raison que le panneau de cartes.
+// Plutot que de traquer un par un chaque endroit oublie, on force tout
+// depuis la racine - legerement plus couteux, mais fiable.
+static void RedrawEverything() {
+    if (!g_hMain) return;
+    RedrawWindow(g_hMain, NULL, NULL,
+        RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_ERASE);
+}
+
 static void UpdateCardsScrollInfo() {
     if (!g_hCardsHost) return;
     RECT rc; GetClientRect(g_hCardsHost, &rc);
@@ -1179,19 +1353,100 @@ static void UpdateCardsScrollInfo() {
     GetScrollInfo(g_hCardsHost, SB_VERT, &si);
     g_scrollPos = si.nPos;
 }
+// Un mod appartient au modpack actuellement filtre (ou aucun filtre actif).
+static bool ModMatchesPack(const Mod& m) {
+    return g_modpackFilter.empty() || m.modpack == g_modpackFilter;
+}
+// Filtre complet utilise pour l'affichage des cartes ET pour "Tout DL" :
+// modpack + masquage des mods a jour. PAS utilise par "Tout verifier", qui
+// doit justement pouvoir decouvrir un changement de statut (voir le
+// commentaire pres de g_hideUpToDate).
+static bool ModPassesFilters(const Mod& m) {
+    if (!ModMatchesPack(m)) return false;
+    if (g_hideUpToDate) {
+        int tsCat = 0;
+        TsStatusText(m, &tsCat);
+        if (tsCat == 1) return false;   // "a jour" masque si le toggle est actif
+    }
+    return true;
+}
+
+// Fait defiler le panneau pour amener ce mod (retrouve par son nom, apres
+// tri ET filtrage) dans la zone visible. Sans ca, ajouter/modifier un mod
+// dont le nom le fait trier loin de la position actuelle de defilement
+// donne l'impression que "rien ne s'est passe" - la carte existe bien,
+// mais hors champ, sans aucune indication a l'ecran.
+static void ScrollToMod(const std::wstring& name) {
+    if (!g_hCardsHost || name.empty()) return;
+    int gIdx = -1;
+    for (size_t k = 0; k < g_mods.size(); ++k)
+        if (g_mods[k].name == name) { gIdx = (int)k; break; }
+    if (gIdx < 0) return;
+    // position parmi les cartes VISIBLES, pas l'index brut dans g_mods : un
+    // filtre actif peut avoir saute des mods, decalant les positions ecran.
+    int visRow = -1;
+    for (size_t v = 0; v < g_visibleIndices.size(); ++v)
+        if (g_visibleIndices[v] == gIdx) { visRow = (int)v; break; }
+    if (visRow < 0) return;   // le mod est filtre, pas de carte a montrer
+
+    int cardTop = visRow * CARD_H;
+    int cardBottom = cardTop + CARD_H;
+    RECT rc; GetClientRect(g_hCardsHost, &rc);
+    int pageH = rc.bottom - rc.top;
+    if (cardTop < g_scrollPos) g_scrollPos = cardTop;
+    else if (cardBottom > g_scrollPos + pageH) g_scrollPos = cardBottom - pageH;
+    if (g_scrollPos < 0) g_scrollPos = 0;
+    UpdateCardsScrollInfo();
+    RepositionCards();
+    RedrawCardsHost();
+}
+
+// Reconstruit le menu deroulant de filtre "Modpack" a partir des noms de
+// modpack distincts presents dans g_mods, en tete "Tous les mods". Conserve
+// la selection courante si ce modpack existe encore, sinon repli sur "tous".
+static void RefillModpackCombo() {
+    HWND combo = g_hMain ? GetDlgItem(g_hMain, IDC_MODPACK) : NULL;
+    if (!combo) return;
+    std::vector<std::wstring> packs;
+    for (size_t i = 0; i < g_mods.size(); ++i) {
+        if (g_mods[i].modpack.empty()) continue;
+        bool found = false;
+        for (size_t k = 0; k < packs.size(); ++k)
+            if (packs[k] == g_mods[i].modpack) { found = true; break; }
+        if (!found) packs.push_back(g_mods[i].modpack);
+    }
+    std::sort(packs.begin(), packs.end());
+
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)L"Tous les mods");
+    for (size_t i = 0; i < packs.size(); ++i)
+        SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)packs[i].c_str());
+
+    int sel = 0;
+    if (!g_modpackFilter.empty()) {
+        for (size_t i = 0; i < packs.size(); ++i)
+            if (packs[i] == g_modpackFilter) { sel = (int)(i + 1); break; }
+        if (sel == 0) g_modpackFilter.clear();   // le modpack filtre a disparu
+    }
+    SendMessageW(combo, CB_SETCURSEL, sel, 0);
+}
 
 static void RefillMods() {
     std::stable_sort(g_mods.begin(), g_mods.end(), ModLess);
-    if (g_hCardsHost) SendMessageW(g_hCardsHost, WM_SETREDRAW, FALSE, 0);
+    RefillModpackCombo();   // peut reinitialiser g_modpackFilter si obsolete
     ClearCards();
+    g_visibleIndices.clear();
 
     const int iconX = 10, textX = 60;
+    int row = 0;   // position parmi les cartes VISIBLES (pas l'index dans g_mods)
     for (size_t i = 0; i < g_mods.size(); ++i) {
         const Mod& m = g_mods[i];
-        int y = (int)i * CARD_H;
+        if (!ModPassesFilters(m)) continue;
+        g_visibleIndices.push_back((int)i);
+        int y = row * CARD_H;
 
         HWND icon = CreateWindowExW(0, L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_ICON | SS_CENTERIMAGE,
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_ICON | SS_CENTERIMAGE,
             iconX, y + 12, 40, 40, g_hCardsHost, NULL, g_hInst, NULL);
         SendMessageW(icon, STM_SETICON, (WPARAM)GetOrLoadHIcon(m.iconPath), 0);
         { CardChild cc; cc.hwnd = icon; cc.x = iconX; cc.y = y + 12; cc.w = 40; cc.h = 40;
@@ -1212,48 +1467,56 @@ static void RefillMods() {
         MkCardStatic(noteTxt, textX, y + 64, 400, 18,
             g_font, RGB(120, 120, 120), SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, true);
 
-        int bx = textX, by = y + 86, bh = 24, gap = 4;
-        int id = RA_BASE + (int)i * RA_COUNT;
-        HWND bWatch = MkCardButton(id + RA_WATCH, L"Watch",  bx, by, 58, bh); bx += 58 + gap;
-        HWND bHist  = MkCardButton(id + RA_HIST,  L"Hist.",  bx, by, 48, bh); bx += 48 + gap;
-        HWND bCheck = MkCardButton(id + RA_CHECK, L"Check+", bx, by, 60, bh); bx += 60 + gap;
-        HWND bMark  = MkCardButton(id + RA_MARK,  L"OK",     bx, by, 38, bh); bx += 38 + gap;
-        HWND bTs    = MkCardButton(id + RA_TS,    L"TS",     bx, by, 36, bh); bx += 36 + gap;
-        HWND bDl    = MkCardButton(id + RA_DL,    L"DL",     bx, by, 36, bh); bx += 36 + gap;
-        HWND bEdit  = MkCardButton(id + RA_EDIT,  L"Modif.", bx, by, 56, bh); bx += 56 + gap;
-        HWND bMore  = MkCardButton(id + RA_MORE,  L"...",    bx, by, 32, bh); bx += 32 + gap;
+        // Boutons a glyphe plutot qu'a texte : des caracteres Unicode
+        // (echappes en \u pour ne pas dependre de l'encodage du fichier
+        // source), pas de vraie image - on evite ainsi tout le pipeline de
+        // chargement d'icone (et ses pieges) pour un simple bouton. Le sens
+        // de chaque glyphe est repris dans l'info-bulle au survol.
+        int bx = textX, by = y + 86, bh = 24, bw = 32, gap = 4;
+        int id = RA_BASE + row * RA_COUNT;
+        HWND bWatch = MkCardButton(id + RA_WATCH, L"\u2197",    bx, by, bw, bh); bx += bw + gap;  // ->  ouvrir
+        HWND bHist  = MkCardButton(id + RA_HIST,  L"\u2261",    bx, by, bw, bh); bx += bw + gap;  // =   historique
+        HWND bCheck = MkCardButton(id + RA_CHECK, L"\u21BB",    bx, by, bw, bh); bx += bw + gap;  // (r) check+ouvrir
+        HWND bMark  = MkCardButton(id + RA_MARK,  L"\u2713",    bx, by, bw, bh); bx += bw + gap;  // v   verifie
+        HWND bTs    = MkCardButton(id + RA_TS,    L"\u26A1",    bx, by, bw, bh); bx += bw + gap;  // eclair  Thunderstore
+        HWND bDl    = MkCardButton(id + RA_DL,    L"\u2193",    bx, by, bw, bh); bx += bw + gap;  // v(bas)  telecharger
+        HWND bEdit  = MkCardButton(id + RA_EDIT,  L"\u270E",    bx, by, bw, bh); bx += bw + gap;  // crayon  modifier
+        HWND bMore  = MkCardButton(id + RA_MORE,  L"...",       bx, by, bw, bh); bx += bw + gap;  // ...  plus d'actions
 
-        AddTip(bWatch, L"Ouvre la page du mod dans le navigateur");
-        AddTip(bHist,  L"Ouvre la page d'historique / changelog du mod");
-        AddTip(bCheck, L"Ouvre la page du mod ET note la date de verification du jour");
-        AddTip(bMark,  L"Note la date de verification SANS ouvrir de lien - deja verifie ailleurs ?");
-        AddTip(bTs,    L"Interroge Thunderstore pour connaitre la derniere version publiee");
-        AddTip(bDl,    L"Telecharge le zip de la derniere version (demande ou l'enregistrer)");
-        AddTip(bEdit,  L"Modifie ce mod");
+        AddTip(bWatch, L"Watch : ouvre la page du mod dans le navigateur");
+        AddTip(bHist,  L"Historique : ouvre la page des changements / versions du mod");
+        AddTip(bCheck, L"Check+ : ouvre la page du mod ET note la date de verification du jour");
+        AddTip(bMark,  L"Verifie : note la date de verification SANS ouvrir de lien - deja verifie ailleurs ?");
+        if (m.nonThunderstore) {
+            EnableWindow(bTs, FALSE);
+            EnableWindow(bDl, FALSE);
+            AddTip(bTs, L"Thunderstore : desactive - ce mod est marque \"Non Thunderstore\" (voir Modifier)");
+            AddTip(bDl, L"Telecharger : desactive - ce mod est marque \"Non Thunderstore\" (voir Modifier)");
+        } else {
+            AddTip(bTs, L"Thunderstore : interroge Thunderstore pour connaitre la derniere version publiee");
+            AddTip(bDl, L"Telecharger : recupere le zip de la derniere version (demande ou l'enregistrer)");
+        }
+        AddTip(bEdit,  L"Modifier ce mod");
         AddTip(bMore,  L"Plus d'actions : copier le lien, localiser le DLL, supprimer...");
 
         MkCardStatic(L"", 8, y + CARD_H - 6, 400, 2, g_font, 0, SS_ETCHEDHORZ, true);
+        ++row;
     }
 
-    g_cardTotalHeight = (int)g_mods.size() * CARD_H;
+    g_cardTotalHeight = row * CARD_H;
     UpdateCardsScrollInfo();
     RepositionCards();
-
-    if (g_hCardsHost) {
-        SendMessageW(g_hCardsHost, WM_SETREDRAW, TRUE, 0);
-        RedrawWindow(g_hCardsHost, NULL, NULL,
-            RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-    }
+    RedrawEverything();
 }
 
 // ---------------------------------------------------------------- editeur mod
 struct EditCtx {
     Mod m;
     bool ok;
-    HWND hName, hCat, hUrl, hHist, hDesc, hDll, hIcon, hNote, hIconPreview;
+    HWND hName, hCat, hUrl, hHist, hDesc, hDll, hIcon, hNote, hIconPreview, hNonTs, hModpack, hInstalledVer;
     HICON previewIcon;
     EditCtx() : ok(false), hName(0), hCat(0), hUrl(0), hHist(0), hDesc(0), hDll(0), hIcon(0),
-                hNote(0), hIconPreview(0), previewIcon(0) {}
+                hNote(0), hIconPreview(0), hNonTs(0), hModpack(0), hInstalledVer(0), previewIcon(0) {}
 };
 
 static HWND MkLabel(HWND p, const wchar_t* t, int x, int y, int w) {
@@ -1332,12 +1595,38 @@ static std::wstring BrowseSaveFile(HWND owner, const wchar_t* filter,
     if (GetSaveFileNameW(&ofn)) return std::wstring(buf);
     return L"";
 }
-static void UpdateIconPreview(EditCtx* c, const std::wstring& path) {
-    if (!c || !c->hIconPreview) return;
+static int CALLBACK BrowseFolderCB(HWND hwnd, UINT msg, LPARAM lp, LPARAM data) {
+    if (msg == BFFM_INITIALIZED && data)
+        SendMessageW(hwnd, BFFM_SETSELECTION, TRUE, data);
+    return 0;
+}
+// Boite systeme "Parcourir les dossiers..." ; renvoie une chaine vide si
+// l'utilisateur annule.
+static std::wstring BrowseFolder(HWND owner, const wchar_t* title, const std::wstring& initial) {
+    BROWSEINFOW bi; memset(&bi, 0, sizeof(bi));
+    wchar_t path[MAX_PATH] = L"";
+    bi.hwndOwner = owner;
+    bi.lpszTitle = title;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    bi.lpfn = BrowseFolderCB;
+    bi.lParam = initial.empty() ? 0 : (LPARAM)initial.c_str();
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) return L"";
+    std::wstring result;
+    if (SHGetPathFromIDListW(pidl, path)) result = path;
+    CoTaskMemFree(pidl);
+    return result;
+}
+// Renvoie true si un chemin non vide a effectivement produit une icone
+// (permet a l'appelant de signaler un echec de chargement au lieu de
+// laisser l'aperçu redevenir silencieusement vide sans explication).
+static bool UpdateIconPreview(EditCtx* c, const std::wstring& path) {
+    if (!c || !c->hIconPreview) return false;
     HICON hi = path.empty() ? NULL : LoadScaledIconFromFile(path, 32);
     SendMessageW(c->hIconPreview, STM_SETICON, (WPARAM)hi, 0);
     if (c->previewIcon) DestroyIcon(c->previewIcon);
     c->previewIcon = hi;
+    return !path.empty() && hi != NULL;
 }
 
 static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1368,25 +1657,76 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             IX, 28, 40, 40, hwnd, NULL, g_hInst, NULL);
         MkDlgButton(hwnd, IDC_E_BROWSEICON, L"Parcourir...", IX, 72, 130, 24);
         MkDlgButton(hwnd, IDC_E_CLEARICON,  L"Effacer",      IX, 100, 130, 24);
+        // Champ texte reellement porteur du chemin (c->m.iconPath en depend
+        // a la sauvegarde) - BUG CORRIGE : ce controle avait disparu d'une
+        // reecriture precedente, laissant c->hIcon a NULL en permanence.
+        // SetWindowTextW/GetTextOf sur un HWND NULL echouent silencieusement,
+        // donc iconPath restait toujours vide malgre un apercu fonctionnel
+        // (l'apercu, lui, utilise directement le chemin choisi, jamais ce
+        // controle - c'est pour ca qu'il marchait sans que le bug se voie).
+        MkLabel(hwnd, L"Chemin", IX, 130, 130);
+        c->hIcon = MkEdit(hwnd, c->m.iconPath, IX, 148, 130);
+
+        // Masque TS/DL sur la carte et exclut ce mod du "Tout verifier" -
+        // pratique pour un mod Nexus/GitHub que l'URL ne suffit pas a ecarter.
+        c->hNonTs = CreateWindowExW(0, L"BUTTON", L"Non Thunderstore",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            IX, 182, 130, 40, hwnd, (HMENU)IDC_E_NONTS, g_hInst, NULL);
+        SendMessageW(c->hNonTs, WM_SETFONT, (WPARAM)g_font, TRUE);
+        SendMessageW(c->hNonTs, BM_SETCHECK,
+            c->m.nonThunderstore ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        // Regroupe des mods pour un meme playthrough/serveur. CBS_DROPDOWN
+        // (pas DROPDOWNLIST) : on peut choisir un modpack existant dans la
+        // liste OU taper librement un nouveau nom.
+        MkLabel(hwnd, L"Modpack (optionnel - regroupe des mods pour un meme playthrough)",
+            LX, 232, LW + 16 + 130);
+        c->hModpack = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWN | WS_VSCROLL | CBS_AUTOHSCROLL,
+            LX, 250, LW + 16 + 130, 200, hwnd, (HMENU)IDC_E_MODPACK, g_hInst, NULL);
+        SendMessageW(c->hModpack, WM_SETFONT, (WPARAM)g_font, TRUE);
+        {
+            // modpacks distincts deja utilises ailleurs, pour les proposer
+            // dans la liste deroulante sans empecher d'en taper un nouveau.
+            std::vector<std::wstring> packs;
+            for (size_t pi = 0; pi < g_mods.size(); ++pi) {
+                if (g_mods[pi].modpack.empty()) continue;
+                bool found = false;
+                for (size_t pk = 0; pk < packs.size(); ++pk)
+                    if (packs[pk] == g_mods[pi].modpack) { found = true; break; }
+                if (!found) packs.push_back(g_mods[pi].modpack);
+            }
+            std::sort(packs.begin(), packs.end());
+            for (size_t pi = 0; pi < packs.size(); ++pi)
+                SendMessageW(c->hModpack, CB_ADDSTRING, 0, (LPARAM)packs[pi].c_str());
+        }
+        SetWindowTextW(c->hModpack, c->m.modpack.c_str());
 
         // -- description (courte, affichee sur la carte) - pleine largeur ---
-        MkLabel(hwnd, L"Description courte (affichee sur la carte)", LX, 232, LW + 16 + 130);
-        c->hDesc = MkEdit(hwnd, c->m.description, LX, 250, LW + 16 + 130);
+        MkLabel(hwnd, L"Description courte (affichee sur la carte)", LX, 282, LW + 16 + 130);
+        c->hDesc = MkEdit(hwnd, c->m.description, LX, 300, LW + 16 + 130);
 
         // -- DLL associe, pleine largeur -------------------------------------
-        MkLabel(hwnd, L"DLL installe (pour verifier qu'il est bien present)", LX, 282, LW + 16 + 130);
-        c->hDll = MkEdit(hwnd, c->m.dllPath, LX, 300, LW);
-        MkDlgButton(hwnd, IDC_E_BROWSEDLL, L"Parcourir...", LX + LW + 24, 300, 124, 24);
+        MkLabel(hwnd, L"DLL installe (pour verifier qu'il est bien present)", LX, 332, LW + 16 + 130);
+        c->hDll = MkEdit(hwnd, c->m.dllPath, LX, 350, LW);
+        MkDlgButton(hwnd, IDC_E_BROWSEDLL, L"Parcourir...", LX + LW + 24, 350, 124, 24);
 
-        MkLabel(hwnd, L"Note (version installee, remarques...)", LX, 330, LW + 16 + 130);
-        c->hNote = MkEdit(hwnd, c->m.note, LX, 348, LW + 16 + 130);
+        // Version qu'on SUIT comme installee - mise a jour automatiquement
+        // par Telecharger/Tout DL (voir ActionDownloadLatest/ActionDownloadAll),
+        // ou modifiable ici a la main si l'installation se fait autrement
+        // (ou si le zip telecharge n'a pas encore ete extrait).
+        MkLabel(hwnd, L"Version installee (suivie par Telecharger, ou a la main)", LX, 382, 260);
+        c->hInstalledVer = MkEdit(hwnd, c->m.installedVersion, LX, 400, 200);
+
+        MkLabel(hwnd, L"Note (remarques diverses)", LX, 432, LW + 16 + 130);
+        c->hNote = MkEdit(hwnd, c->m.note, LX, 450, LW + 16 + 130);
 
         HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            336, 386, 92, 28, hwnd, (HMENU)IDOK, g_hInst, NULL);
+            336, 488, 92, 28, hwnd, (HMENU)IDOK, g_hInst, NULL);
         HWND ca = CreateWindowExW(0, L"BUTTON", L"Annuler",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            436, 386, 92, 28, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
+            436, 488, 92, 28, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
         SendMessageW(ok, WM_SETFONT, (WPARAM)g_font, TRUE);
         SendMessageW(ca, WM_SETFONT, (WPARAM)g_font, TRUE);
 
@@ -1427,16 +1767,22 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!r.category.empty())     SetWindowTextW(c->hCat, r.category.c_str());
             if (!r.changelogUrl.empty()) SetWindowTextW(c->hHist, r.changelogUrl.c_str());
             if (!r.description.empty())  SetWindowTextW(c->hDesc, r.description.c_str());
+            bool iconLoadedOk = true;
             if (!r.localIconPath.empty()) {
                 SetWindowTextW(c->hIcon, r.localIconPath.c_str());
-                UpdateIconPreview(c, r.localIconPath);
+                iconLoadedOk = UpdateIconPreview(c, r.localIconPath);
             }
             c->m.tsVersion = r.latestVersion;   // porte jusqu'a l'enregistrement (pas de champ texte dedie)
+            c->m.tsLatestDate = r.latestDate;
 
             std::wstring summary = L"Champs remplis depuis Thunderstore.\n"
                 L"Derniere version publiee : " + r.latestVersion;
             if (r.localIconPath.empty())
                 summary += L"\n(icone non recuperee - le mod n'en a peut-etre pas)";
+            else if (!iconLoadedOk)
+                summary += L"\n(icone telechargee mais illisible - fichier corrompu ou\n"
+                          L"format non gere par GDI+ ; le chemin est garde dans le champ\n"
+                          L"Icone au cas ou, mais l'apercu restera vide)";
             Info(hwnd, summary.c_str());
             return 0;
         }
@@ -1453,7 +1799,17 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 L"Tous les fichiers (*.*)\0*.*\0",
                 GetTextOf(c->hIcon), L"Choisir une icone");
             SetWindowTextW(c->hIcon, picked.c_str());
-            UpdateIconPreview(c, picked);
+            if (!picked.empty() && !UpdateIconPreview(c, picked)) {
+                MessageBoxW(hwnd,
+                    L"Ce fichier n'a pas pu etre charge comme icone.\n\n"
+                    L"Causes possibles :\n"
+                    L"- format non gere par GDI+ (WEBP et AVIF ne sont PAS geres ;\n"
+                    L"  utilise plutot un PNG ou JPG)\n"
+                    L"- fichier corrompu ou incomplet\n\n"
+                    L"Le champ garde quand meme le chemin choisi, au cas ou le\n"
+                    L"probleme vienne d'ailleurs - mais l'apercu restera vide.",
+                    L"ValMods", MB_OK | MB_ICONWARNING);
+            }
             return 0;
         }
         if (LOWORD(wp) == IDC_E_CLEARICON && c) {
@@ -1475,8 +1831,11 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             c->m.changelogUrl = Clean(GetTextOf(c->hHist));
             c->m.description  = Clean(GetTextOf(c->hDesc));
             c->m.dllPath      = Clean(GetTextOf(c->hDll));
+            c->m.installedVersion = Clean(GetTextOf(c->hInstalledVer));
             c->m.iconPath     = Clean(GetTextOf(c->hIcon));
             c->m.note = Clean(GetTextOf(c->hNote));
+            c->m.nonThunderstore = (SendMessageW(c->hNonTs, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            c->m.modpack = Clean(GetTextOf(c->hModpack));
             c->ok = true;
             DestroyWindow(hwnd);
             return 0;
@@ -1509,7 +1868,7 @@ static bool ShowModEditor(HWND parent, const wchar_t* title, Mod& io) {
         reg = true;
     }
     EditCtx ctx; ctx.m = io;
-    RECT r = { 0, 0, 540, 430 };
+    RECT r = { 0, 0, 540, 530 };
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     AdjustWindowRect(&r, style, FALSE);
     RECT pr; GetWindowRect(parent, &pr);
@@ -1633,22 +1992,11 @@ static void BackupSelection(HWND hwnd) {
 // Chaque action prend l'index du mod concerne EXPLICITEMENT (idx), passe par
 // le bouton de la carte qui l'a declenchee - il n'y a plus de "selection"
 // au sens ListView depuis le passage a la vue en cartes.
-static void UpdateTitle();
-
 static bool ValidMod(HWND hwnd, int idx) {
     if (idx >= 0 && idx < (int)g_mods.size()) return true;
     Info(hwnd, L"Ce mod n'est plus dans la liste (elle a change entre-temps).");
     return false;
 }
-static void RefreshModsUI() {
-    RefreshModsUI();
-    UpdateTitle();
-    if (g_hCardsHost) {
-        RedrawWindow(g_hCardsHost, NULL, NULL,
-            RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-    }
-}
-
 static void ActionOpen(HWND hwnd, int idx, bool stamp) {
     if (!ValidMod(hwnd, idx)) return;
     std::wstring url = g_mods[idx].url;
@@ -1657,14 +2005,14 @@ static void ActionOpen(HWND hwnd, int idx, bool stamp) {
     if (stamp) {
         g_mods[idx].last = NowStamp();
         SaveMods();
-        RefreshModsUI();
+        RefillMods();
     }
 }
 static void ActionMark(HWND hwnd, int idx) {
     if (!ValidMod(hwnd, idx)) return;
     g_mods[idx].last = NowStamp();
     SaveMods();
-    RefreshModsUI();
+    RefillMods();
 }
 static void ActionAdd(HWND hwnd) {
     Mod m;
@@ -1673,7 +2021,8 @@ static void ActionAdd(HWND hwnd) {
     if (ShowModEditor(hwnd, L"Ajouter un mod", m)) {
         g_mods.push_back(m);
         SaveMods();
-        RefreshModsUI();
+        RefillMods();
+        ScrollToMod(m.name);
     }
 }
 static void ActionEdit(HWND hwnd, int idx) {
@@ -1682,7 +2031,8 @@ static void ActionEdit(HWND hwnd, int idx) {
     if (ShowModEditor(hwnd, L"Modifier le mod", m)) {
         g_mods[idx] = m;
         SaveMods();
-        RefreshModsUI();
+        RefillMods();
+        ScrollToMod(m.name);
     }
 }
 static void ActionDelete(HWND hwnd, int idx) {
@@ -1692,7 +2042,7 @@ static void ActionDelete(HWND hwnd, int idx) {
     if (MessageBoxW(hwnd, q.c_str(), L"ValMods", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
     g_mods.erase(g_mods.begin() + idx);
     SaveMods();
-    RefreshModsUI();
+    RefillMods();
 }
 static void ActionCopy(HWND hwnd, int idx) {
     if (!ValidMod(hwnd, idx)) return;
@@ -1747,6 +2097,11 @@ static void ShowRowOverflowMenu(HWND hwnd, int idx) {
 }
 static void ActionCheckThunderstore(HWND hwnd, int idx) {
     if (!ValidMod(hwnd, idx)) return;
+    if (g_mods[idx].nonThunderstore) {
+        Info(hwnd, L"Ce mod est marque \"Non Thunderstore\" (voir Modifier) - "
+                   L"la verification est desactivee pour lui.");
+        return;
+    }
     std::wstring name = g_mods[idx].name;
     std::wstring url = g_mods[idx].url;
 
@@ -1771,6 +2126,7 @@ static void ActionCheckThunderstore(HWND hwnd, int idx) {
     for (size_t k = 0; k < g_mods.size(); ++k) {
         if (g_mods[k].name == name) {
             g_mods[k].tsVersion = r.latestVersion;
+            g_mods[k].tsLatestDate = r.latestDate;
             // bonus non-destructif : on ne remplit la description que si
             // elle est vide, contrairement a Auto-remplir qui l'ecrase
             // toujours (ici ce n'est pas l'action demandee explicitement).
@@ -1789,8 +2145,98 @@ static void ActionCheckThunderstore(HWND hwnd, int idx) {
               L"par son auteur sur Thunderstore.";
     Info(hwnd, msg.c_str());
 }
+// Verifie tous les mods eligibles (lien Thunderstore, non marques "Non
+// Thunderstore") en une seule fois. Synchrone et sequentiel comme le reste
+// des appels reseau de l'appli - potentiellement long pour une longue
+// liste, d'ou la confirmation prealable qui indique combien de mods sont
+// concernes avant de se lancer.
+static void ActionCheckAll(HWND hwnd) {
+    if (g_mods.empty()) { Info(hwnd, L"Aucun mod dans la liste."); return; }
+
+    int eligible = 0;
+    for (size_t i = 0; i < g_mods.size(); ++i) {
+        if (g_mods[i].nonThunderstore || !ModMatchesPack(g_mods[i])) continue;
+        std::wstring ns, nm;
+        if (ParseThunderstoreUrl(g_mods[i].url, ns, nm)) ++eligible;
+    }
+    if (eligible == 0) {
+        Info(hwnd, L"Aucun mod eligible : il faut un lien vers thunderstore.io,\n"
+                   L"ne pas etre marque \"Non Thunderstore\" (voir Modifier), et\n"
+                   L"correspondre au filtre modpack actuel s'il y en a un.");
+        return;
+    }
+    std::wstring packLabel = g_modpackFilter.empty() ? L"tous les mods" : (L"modpack \"" + g_modpackFilter + L"\"");
+    std::wstring q = L"Verifier les " + std::to_wstring(eligible) + L" mod(s) Thunderstore de la liste (" +
+        packLabel + L") ?\n\n"
+        L"Derniere verification globale : " +
+        (g_lastGlobalCheck.empty() ? L"jamais" : g_lastGlobalCheck) + L"\n\n"
+        L"Ca ne modifie PAS la date de verification individuelle de chaque\n"
+        L"mod (reservee a une verification manuelle) - seule une date de\n"
+        L"verification globale, separee, sera mise a jour.\n\n"
+        L"Ca peut prendre du temps : un appel reseau par mod, l'un apres\n"
+        L"l'autre (pas en parallele).";
+    if (MessageBoxW(hwnd, q.c_str(), L"ValMods", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+
+    // Comme les autres actions, on retrouve chaque mod par son nom plutot
+    // que par index, au cas ou la liste serait retriee en cours de route
+    // (ici ca n'arrive pas puisque rien d'autre ne tourne pendant la
+    // boucle, mais ca reste la facon coherente de faire dans ce fichier).
+    std::vector<std::wstring> names;
+    for (size_t i = 0; i < g_mods.size(); ++i) names.push_back(g_mods[i].name);
+
+    HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
+    int outdated = 0, upToDate = 0, errors = 0, skipped = 0;
+    for (size_t i = 0; i < names.size(); ++i) {
+        int idx = -1;
+        for (size_t k = 0; k < g_mods.size(); ++k)
+            if (g_mods[k].name == names[i]) { idx = (int)k; break; }
+        if (idx < 0) continue;
+        if (g_mods[idx].nonThunderstore || !ModMatchesPack(g_mods[idx])) { ++skipped; continue; }
+
+        std::wstring url = g_mods[idx].url;
+        std::wstring ns, nm;
+        if (!ParseThunderstoreUrl(url, ns, nm)) { ++skipped; continue; }
+
+        TsCheckResult r = CheckThunderstoreVersion(url);
+        if (!r.ok) { ++errors; continue; }
+
+        bool isOutdated = false;
+        std::wstring installed = GetEffectiveInstalledVersion(g_mods[idx]);
+        if (!installed.empty() && VersionLess(installed, r.latestVersion)) isOutdated = true;
+
+        g_mods[idx].tsVersion = r.latestVersion;
+        g_mods[idx].tsLatestDate = r.latestDate;
+        if (g_mods[idx].description.empty() && !r.description.empty())
+            g_mods[idx].description = r.description;
+        // PAS de g_mods[idx].last ici : "Tout verifier" est une operation
+        // groupee/automatisee, distincte d'une verification personnelle -
+        // seule g_lastGlobalCheck (globale, separee) est mise a jour plus
+        // bas. Toucher "last" ici casserait le code couleur individuel
+        // (rouge/orange/vert/gris) qui sert justement a repondre a "quels
+        // mods n'ai-je pas regardes moi-meme depuis longtemps ?".
+
+        if (isOutdated) ++outdated; else ++upToDate;
+    }
+    SetCursor(oldCursor);
+
+    g_lastGlobalCheck = NowStamp();
+    SaveMods();
+    RefillMods();
+
+    std::wstring summary = L"Verification terminee (" + g_lastGlobalCheck + L").\n\n" +
+        std::to_wstring(outdated) + L" mise(s) a jour disponible(s)\n" +
+        std::to_wstring(upToDate) + L" a jour\n" +
+        std::to_wstring(errors)  + L" erreur(s)\n" +
+        std::to_wstring(skipped) + L" ignore(s) (non Thunderstore / hors modpack)";
+    Info(hwnd, summary.c_str());
+}
 static void ActionDownloadLatest(HWND hwnd, int idx) {
     if (!ValidMod(hwnd, idx)) return;
+    if (g_mods[idx].nonThunderstore) {
+        Info(hwnd, L"Ce mod est marque \"Non Thunderstore\" (voir Modifier) - "
+                   L"le telechargement est desactive pour lui.");
+        return;
+    }
     std::wstring name = g_mods[idx].name;
     std::wstring url = g_mods[idx].url;
 
@@ -1803,6 +2249,7 @@ static void ActionDownloadLatest(HWND hwnd, int idx) {
     }
 
     std::wstring version = g_mods[idx].tsVersion;
+    std::wstring latestDate = g_mods[idx].tsLatestDate;
     if (version.empty()) {
         // pas encore verifie : on va d'abord chercher la derniere version
         HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
@@ -1814,6 +2261,7 @@ static void ActionDownloadLatest(HWND hwnd, int idx) {
             return;
         }
         version = chk.latestVersion;
+        latestDate = chk.latestDate;
     }
 
     // "Parcourir" pour choisir ou enregistrer le zip - suggestion par defaut
@@ -1838,10 +2286,15 @@ static void ActionDownloadLatest(HWND hwnd, int idx) {
     }
 
     // confirme/rafraichit tsVersion + date de verification (le telechargement
-    // implique qu'on connait desormais la version exacte tres precisement)
+    // implique qu'on connait desormais la version exacte tres precisement).
+    // installedVersion est aussi mis a jour : on suppose que ce zip va etre
+    // extrait dans BepInEx/plugins (editable a la main dans l'editeur si ce
+    // n'est pas le cas, ou si l'installation se fait autrement).
     for (size_t k = 0; k < g_mods.size(); ++k) {
         if (g_mods[k].name == name) {
             g_mods[k].tsVersion = version;
+            g_mods[k].tsLatestDate = latestDate;
+            g_mods[k].installedVersion = version;
             g_mods[k].last = NowStamp();
             SaveMods();
             RefillMods();
@@ -1851,8 +2304,99 @@ static void ActionDownloadLatest(HWND hwnd, int idx) {
 
     std::wstring msg = L"Version " + version + L" telechargee :\n" + destPath +
         L"\n\nA extraire toi-meme dans BepInEx\\plugins - ValMods ne modifie\n"
-        L"jamais tes fichiers de jeu automatiquement.";
+        L"jamais tes fichiers de jeu automatiquement.\n\n"
+        L"La version suivie comme installee a ete mise a jour a " + version +
+        L" (a corriger dans Modifier si tu n'extrais pas ce zip).";
     Info(hwnd, msg.c_str());
+}
+// Telecharge le zip de la derniere version de tous les mods eligibles dans
+// UN SEUL dossier choisi une fois pour toutes (au lieu d'une boite
+// "Enregistrer sous..." par mod). Ne met PAS a jour la date de verification
+// individuelle de chaque mod - meme logique que "Tout verifier" (voir
+// ActionCheckAll) : une operation groupee n'est pas une verification
+// personnelle. tsVersion est en revanche mis a jour (donnee utile, pas un
+// "j'ai regarde ce mod moi-meme").
+static void ActionDownloadAll(HWND hwnd) {
+    if (g_mods.empty()) { Info(hwnd, L"Aucun mod dans la liste."); return; }
+
+    int eligible = 0;
+    for (size_t i = 0; i < g_mods.size(); ++i) {
+        if (g_mods[i].nonThunderstore || !ModPassesFilters(g_mods[i])) continue;
+        std::wstring ns, nm;
+        if (ParseThunderstoreUrl(g_mods[i].url, ns, nm)) ++eligible;
+    }
+    if (eligible == 0) {
+        Info(hwnd, L"Aucun mod eligible : il faut un lien vers thunderstore.io,\n"
+                   L"ne pas etre marque \"Non Thunderstore\" (voir Modifier), et\n"
+                   L"correspondre aux filtres actuels (modpack / masquage des mods a jour).");
+        return;
+    }
+
+    std::wstring packLabel = g_modpackFilter.empty() ? L"tous les mods" : (L"modpack \"" + g_modpackFilter + L"\"");
+    std::wstring q = L"Telecharger les zips des " + std::to_wstring(eligible) +
+        L" mod(s) Thunderstore de la liste (" + packLabel +
+        (g_hideUpToDate ? L", mods a jour masques" : L"") + L") dans UN dossier de ton choix ?\n\n"
+        L"Un zip par mod. Si sa derniere version n'est pas deja connue, elle\n"
+        L"est verifiee d'abord (appel reseau supplementaire pour ce mod).\n\n"
+        L"Ca peut prendre du temps sur une longue liste.";
+    if (MessageBoxW(hwnd, q.c_str(), L"ValMods", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+
+    MakeDirs(DownloadsRoot());
+    std::wstring targetDir = BrowseFolder(hwnd,
+        L"Choisir le dossier ou enregistrer tous les zips", DownloadsRoot());
+    if (targetDir.empty()) return;   // annule
+
+    std::vector<std::wstring> names;
+    for (size_t i = 0; i < g_mods.size(); ++i) names.push_back(g_mods[i].name);
+
+    HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
+    int downloaded = 0, errors = 0, skipped = 0;
+    for (size_t i = 0; i < names.size(); ++i) {
+        int idx = -1;
+        for (size_t k = 0; k < g_mods.size(); ++k)
+            if (g_mods[k].name == names[i]) { idx = (int)k; break; }
+        if (idx < 0) continue;
+        if (g_mods[idx].nonThunderstore || !ModPassesFilters(g_mods[idx])) { ++skipped; continue; }
+
+        std::wstring ns, nm;
+        if (!ParseThunderstoreUrl(g_mods[idx].url, ns, nm)) { ++skipped; continue; }
+
+        std::wstring version = g_mods[idx].tsVersion;
+        if (version.empty()) {
+            TsCheckResult chk = CheckThunderstoreVersion(g_mods[idx].url);
+            if (!chk.ok) { ++errors; continue; }
+            version = chk.latestVersion;
+            g_mods[idx].tsVersion = version;
+            g_mods[idx].tsLatestDate = chk.latestDate;
+        }
+
+        std::wstring destPath = targetDir + L"\\" + SanitizeFileName(ns) + L"-" +
+                                SanitizeFileName(nm) + L"-" + SanitizeFileName(version) + L".zip";
+        std::wstring err;
+        if (DownloadThunderstoreZip(ns, nm, version, destPath, err)) {
+            ++downloaded;
+            // meme logique que Telecharger (mod par mod) : on suppose que ce
+            // zip va etre extrait, donc on suit cette version comme installee.
+            g_mods[idx].installedVersion = version;
+        } else {
+            ++errors;
+        }
+    }
+    SetCursor(oldCursor);
+
+    SaveMods();
+    RefillMods();
+
+    std::wstring summary = L"Telechargement groupe termine.\n\n"
+        L"Dossier : " + targetDir + L"\n\n" +
+        std::to_wstring(downloaded) + L" telecharge(s)\n" +
+        std::to_wstring(errors)     + L" erreur(s)\n" +
+        std::to_wstring(skipped)    + L" ignore(s) (non Thunderstore / hors filtres)\n\n"
+        L"A extraire toi-meme dans BepInEx\\plugins - ValMods ne modifie\n"
+        L"jamais tes fichiers de jeu automatiquement.\n\n"
+        L"La version suivie comme installee a ete mise a jour pour chaque\n"
+        L"mod telecharge (a corriger dans Modifier si tu n'extrais pas un zip).";
+    Info(hwnd, summary.c_str());
 }
 
 // ---------------------------------------------------------------- parametres
@@ -1900,16 +2444,38 @@ static void LayoutAll(HWND hwnd) {
     if (pw < 100) pw = 100;
     if (ph < 100) ph = 100;
 
-    // --- onglet mods : barre (Ajouter + tri) + panneau de cartes scrollable
-    const int bh = 28, gap = 6, topH = bh + 4;
+    // --- onglet mods : barre sur 2 rangees + panneau de cartes scrollable
+    // (rangee 1 : gestion/tri de la liste - rangee 2 : filtres + actions
+    // groupees, qui operent toutes deux sur le meme sous-ensemble filtre)
+    const int bh = 28, gap = 6, topH = 2 * (bh + gap) + 4;
     HWND badd = GetDlgItem(hwnd, IDC_BADD);
-    if (badd) MoveWindow(badd, px, py, 100, bh, TRUE);
+    int x = px;
+    if (badd) MoveWindow(badd, x, py, 100, bh, TRUE);
+    x += 100 + gap;
     HWND combo = GetDlgItem(hwnd, IDC_SORTCOMBO);
     // la hauteur passee a un CBS_DROPDOWNLIST fixe celle de la liste DEROULEE,
     // pas celle du controle ferme (determinee par la police) - 200 est large.
-    if (combo) MoveWindow(combo, px + 100 + gap, py, 220, 200, TRUE);
+    if (combo) MoveWindow(combo, x, py, 220, 200, TRUE);
+    x += 220 + gap;
     HWND dirBtn = GetDlgItem(hwnd, IDC_SORTDIR);
-    if (dirBtn) MoveWindow(dirBtn, px + 100 + gap + 220 + gap, py, 120, bh, TRUE);
+    if (dirBtn) MoveWindow(dirBtn, x, py, 120, bh, TRUE);
+
+    int y2 = py + bh + gap;
+    x = px;
+    HWND packCombo = GetDlgItem(hwnd, IDC_MODPACK);
+    if (packCombo) MoveWindow(packCombo, x, y2, 180, 200, TRUE);
+    x += 180 + gap;
+    HWND hideUpToDateChk = GetDlgItem(hwnd, IDC_HIDEUPTODATE);
+    if (hideUpToDateChk) MoveWindow(hideUpToDateChk, x, y2, 150, bh, TRUE);
+    x += 150 + gap;
+    HWND checkAllBtn = GetDlgItem(hwnd, IDC_CHECKALL);
+    if (checkAllBtn) MoveWindow(checkAllBtn, x, y2, 130, bh, TRUE);
+    x += 130 + gap;
+    HWND dlAllBtn = GetDlgItem(hwnd, IDC_DLALL);
+    if (dlAllBtn) MoveWindow(dlAllBtn, x, y2, 110, bh, TRUE);
+    x += 110 + gap;
+    HWND show10Chk = GetDlgItem(hwnd, IDC_SHOW10);
+    if (show10Chk) MoveWindow(show10Chk, x, y2, 90, bh, TRUE);
     if (g_hCardsHost) MoveWindow(g_hCardsHost, px, py + topH, pw, ph - topH, TRUE);
 
     // --- onglet sauvegardes
@@ -2002,6 +2568,7 @@ static LRESULT CALLBACK CardsHostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         si.fMask = SIF_POS; si.nPos = pos;
         SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
         RepositionCards();
+        RedrawCardsHost();
         return 0;
     }
     case WM_MOUSEWHEEL: {
@@ -2020,6 +2587,7 @@ static LRESULT CALLBACK CardsHostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         si.fMask = SIF_POS; si.nPos = pos;
         SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
         RepositionCards();
+        RedrawCardsHost();
         return 0;
     }
     case WM_CTLCOLORSTATIC: {
@@ -2106,8 +2674,48 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HWND dirBtn = MkButton(hwnd, IDC_SORTDIR, L"^ Croissant");
         g_pageMods[g_nMods++] = dirBtn;
 
+        HWND checkAllBtn = MkButton(hwnd, IDC_CHECKALL, L"Tout verifier");
+        g_pageMods[g_nMods++] = checkAllBtn;
+
+        HWND dlAllBtn = MkButton(hwnd, IDC_DLALL, L"Tout DL");
+        g_pageMods[g_nMods++] = dlAllBtn;
+
+        // Filtre par modpack : reconstruit dynamiquement dans RefillMods()
+        // (voir RefillModpackCombo) a partir des modpacks reellement
+        // utilises - vide au demarrage, rempli une fois LoadData()+
+        // RefillMods() executes plus bas.
+        HWND packCombo = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+            0, 0, 10, 200, hwnd, (HMENU)IDC_MODPACK, g_hInst, NULL);
+        SendMessageW(packCombo, WM_SETFONT, (WPARAM)g_font, TRUE);
+        SendMessageW(packCombo, CB_ADDSTRING, 0, (LPARAM)L"Tous les mods");
+        SendMessageW(packCombo, CB_SETCURSEL, 0, 0);
+        g_pageMods[g_nMods++] = packCombo;
+
+        HWND hideUpToDateChk = CreateWindowExW(0, L"BUTTON", L"Masquer a jour",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            0, 0, 10, 10, hwnd, (HMENU)IDC_HIDEUPTODATE, g_hInst, NULL);
+        SendMessageW(hideUpToDateChk, WM_SETFONT, (WPARAM)g_font, TRUE);
+        SendMessageW(hideUpToDateChk, BM_SETCHECK,
+            g_hideUpToDate ? BST_CHECKED : BST_UNCHECKED, 0);
+        g_pageMods[g_nMods++] = hideUpToDateChk;
+
+        HWND show10Chk = CreateWindowExW(0, L"BUTTON", L"Info 1.0",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            0, 0, 10, 10, hwnd, (HMENU)IDC_SHOW10, g_hInst, NULL);
+        SendMessageW(show10Chk, WM_SETFONT, (WPARAM)g_font, TRUE);
+        SendMessageW(show10Chk, BM_SETCHECK,
+            g_showValheim10 ? BST_CHECKED : BST_UNCHECKED, 0);
+        g_pageMods[g_nMods++] = show10Chk;
+
         WNDCLASSEXW cwc; memset(&cwc, 0, sizeof(cwc));
         cwc.cbSize = sizeof(cwc);
+        // CS_HREDRAW | CS_VREDRAW : sans ca, Windows ne reinvalide pas toute
+        // la zone client au redimensionnement, et les zones liberees par des
+        // enfants qui se deplacent peuvent ne jamais etre redessinees -
+        // c'etait un oubli, et la cause la plus probable de "resize fait
+        // disparaitre des cartes".
+        cwc.style = CS_HREDRAW | CS_VREDRAW;
         cwc.lpfnWndProc = CardsHostProc;
         cwc.hInstance = g_hInst;
         cwc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -2137,6 +2745,18 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             AddTip(GetDlgItem(hwnd, IDC_BADD), L"Ajoute un nouveau mod a la liste");
             AddTip(combo,  L"Choisit le critere de tri de la liste");
             AddTip(dirBtn, L"Inverse l'ordre de tri (croissant / decroissant)");
+            AddTip(packCombo, L"Filtre l'affichage sur un modpack donne (regroupement de mods\n"
+                              L"assigne dans l'editeur) - affecte aussi Tout verifier / Tout DL");
+            AddTip(hideUpToDateChk, L"Masque les mods deja a jour (statut Thunderstore vert) de\n"
+                                   L"l'affichage ET de Tout DL - pas de Tout verifier, qui doit\n"
+                                   L"justement pouvoir decouvrir un changement de statut");
+            AddTip(checkAllBtn, L"Verifie tous les mods Thunderstore de la liste, "
+                                L"un par un (peut prendre du temps)");
+            AddTip(dlAllBtn, L"Telecharge les zips de tous les mods Thunderstore de la liste "
+                             L"dans un seul dossier de ton choix");
+            AddTip(show10Chk, L"Affiche/masque l'indicateur \"1.0\" sur les cartes - a decocher "
+                              L"juste apres la sortie de la 1.0 si les moddeurs n'ont pas encore\n"
+                              L"eu le temps de mettre a jour leurs mods");
         }
 
 
@@ -2168,6 +2788,15 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_pageSaves[g_nSaves++] = MkButton(hwnd, IDC_BOPENBK,   L"Ouvrir les backups");
 
         LoadData();
+        // les cases ont ete creees avant LoadData() (elles doivent exister
+        // avant pour que RefillMods/BuildDetailsLine, qui suivent, s'appuient
+        // sur le bon etat) - on resynchronise donc leur affichage avec la
+        // valeur effectivement chargee, sans quoi elles resteraient toujours
+        // a leur etat par defaut meme si le fichier disait le contraire.
+        SendMessageW(GetDlgItem(hwnd, IDC_SHOW10), BM_SETCHECK,
+            g_showValheim10 ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageW(GetDlgItem(hwnd, IDC_HIDEUPTODATE), BM_SETCHECK,
+            g_hideUpToDate ? BST_CHECKED : BST_UNCHECKED, 0);
         RefillMods();
         ShowPage(0);
         UpdateTitle();
@@ -2177,6 +2806,15 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE:
         LayoutAll(hwnd);
         return 0;
+
+    // CS_HREDRAW|CS_VREDRAW se charge du repaint pendant le glisser
+    // (peu couteux, gere par le systeme) ; on ajoute un repaint complet et
+    // explicite une fois le redimensionnement termine, en filet de securite
+    // pour les controles qui echapperaient encore a l'invalidation normale
+    // (ex: le menu de tri).
+    case WM_EXITSIZEMOVE:
+        RedrawEverything();
+        break;
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mm = (MINMAXINFO*)lp;
@@ -2190,15 +2828,21 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int cid = LOWORD(wp);
 
         // boutons dynamiques d'une carte de mod (voir RA_BASE/RA_COUNT) :
-        // id = RA_BASE + index_ligne * RA_COUNT + action. On POSTE l'action
-        // (voir le commentaire pres de WM_APP_ROWACTION) sauf "..." qui se
-        // contente d'ouvrir un menu et ne detruit aucune fenetre.
+        // id = RA_BASE + position_visible * RA_COUNT + action. Un filtre
+        // (modpack, masquage des mods a jour) peut avoir saute des mods :
+        // rowIdx est une position parmi les cartes AFFICHEES, pas un index
+        // direct dans g_mods - on traduit via g_visibleIndices avant tout
+        // usage, pour que tout le code en aval (Action*, menu "...") reste
+        // simple et manipule directement le bon index reel.
         if (cid >= RA_BASE) {
             int raw = cid - RA_BASE;
             int action = raw % RA_COUNT;
             int rowIdx = raw / RA_COUNT;
-            if (action == RA_MORE) ShowRowOverflowMenu(hwnd, rowIdx);
-            else PostMessageW(hwnd, WM_APP_ROWACTION, (WPARAM)action, (LPARAM)rowIdx);
+            int modIdx = (rowIdx >= 0 && rowIdx < (int)g_visibleIndices.size())
+                ? g_visibleIndices[rowIdx] : -1;
+            if (modIdx < 0) return 0;   // liste filtree/modifiee entre le clic et le traitement
+            if (action == RA_MORE) ShowRowOverflowMenu(hwnd, modIdx);
+            else PostMessageW(hwnd, WM_APP_ROWACTION, (WPARAM)action, (LPARAM)modIdx);
             return 0;
         }
         if (cid == IDC_SORTCOMBO && HIWORD(wp) == CBN_SELCHANGE) {
@@ -2208,9 +2852,35 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (sel >= 0 && sel < 7) { g_sortCol = SORT_MAP[sel]; RefillMods(); }
             return 0;
         }
+        if (cid == IDC_MODPACK && HIWORD(wp) == CBN_SELCHANGE) {
+            HWND pc = GetDlgItem(hwnd, IDC_MODPACK);
+            int sel = (int)SendMessageW(pc, CB_GETCURSEL, 0, 0);
+            if (sel <= 0) {
+                g_modpackFilter.clear();   // "Tous les mods" est toujours l'entree 0
+            } else {
+                wchar_t buf[256] = L"";
+                SendMessageW(pc, CB_GETLBTEXT, sel, (LPARAM)buf);
+                g_modpackFilter = buf;
+            }
+            SaveMods();
+            RefillMods();
+            return 0;
+        }
 
         switch (cid) {
         case IDC_BADD: ActionAdd(hwnd); return 0;
+        case IDC_CHECKALL: ActionCheckAll(hwnd); return 0;
+        case IDC_DLALL: ActionDownloadAll(hwnd); return 0;
+        case IDC_SHOW10:
+            g_showValheim10 = (SendMessageW(GetDlgItem(hwnd, IDC_SHOW10), BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SaveMods();
+            RefillMods();
+            return 0;
+        case IDC_HIDEUPTODATE:
+            g_hideUpToDate = (SendMessageW(GetDlgItem(hwnd, IDC_HIDEUPTODATE), BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SaveMods();
+            RefillMods();
+            return 0;
         case IDC_SORTDIR:
             g_sortAsc = !g_sortAsc;
             SetWindowTextW(GetDlgItem(hwnd, IDC_SORTDIR), g_sortAsc ? L"^ Croissant" : L"v Decroissant");
@@ -2245,24 +2915,30 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::wstring about =
                 L"ValMods " + U2W(VALMODS_VERSION) + L" - gestionnaire manuel de mods Valheim\n\n";
             about +=
-                L"Chaque mod est une carte avec ses propres boutons :\n"
-                L"Watch          : ouvre la page du mod\n"
-                L"Hist.          : ouvre la page des changements / versions\n"
-                L"Check+         : ouvre la page du mod ET note la date de verification\n"
-                L"OK             : note la date de verification SANS ouvrir de lien\n"
-                L"                 (utile si tu as deja verifie ailleurs : Discord du\n"
-                L"                 mod, changelog deja ouvert dans un autre onglet...)\n"
-                L"TS             : verifie la derniere version sur Thunderstore\n"
-                L"DL             : telecharge le zip (demande ou l'enregistrer)\n"
-                L"Modif.         : modifie le mod\n"
-                L"...            : copier le lien, localiser le DLL, ouvrir son\n"
-                L"                 dossier, supprimer\n\n"
+                L"Chaque mod est une carte avec ses propres boutons (survole-les pour\n"
+                L"voir leur nom, ils sont a base de symboles plutot que de texte) :\n"
+                L"\u2197  Watch  : ouvre la page du mod\n"
+                L"\u2261  Hist.  : ouvre la page des changements / versions\n"
+                L"\u21BB  Check+ : ouvre la page du mod ET note la date de verification\n"
+                L"\u2713  OK     : note la date de verification SANS ouvrir de lien\n"
+                L"           (utile si tu as deja verifie ailleurs : Discord du\n"
+                L"           mod, changelog deja ouvert dans un autre onglet...)\n"
+                L"\u26A1  TS     : verifie la derniere version sur Thunderstore\n"
+                L"\u2193  DL     : telecharge le zip (demande ou l'enregistrer)\n"
+                L"\u270E  Modif. : modifie le mod\n"
+                L"...       : copier le lien, localiser le DLL, ouvrir son\n"
+                L"           dossier, supprimer\n\n"
                 L"Le menu deroulant en haut choisit le critere de tri, le bouton a\n"
                 L"cote inverse l'ordre (croissant / decroissant).\n\n"
-                L"La ligne de details (categorie / verif / DLL / TS) est coloree :\n"
+                L"La ligne de details (categorie / verif / DLL / TS / 1.0) est coloree :\n"
                 L"rouge = probleme (DLL manquant ou mise a jour disponible),\n"
                 L"orange = verification ancienne (14+ jours), vert = tout va bien,\n"
                 L"gris = jamais verifie.\n\n"
+                L"\"1.0\" indique si la derniere version publiee du mod date d'apres la\n"
+                L"sortie de Valheim 1.0 (Deep North, 9 septembre 2026) : \"inconnu\" tant\n"
+                L"que la version n'a jamais ete verifiee, \"pas encore sortie\" tant que\n"
+                L"le 9 septembre n'est pas arrive (rien d'anormal), \"a verifier\" une\n"
+                L"fois la 1.0 sortie si ce mod n'a pas ete mis a jour depuis.\n\n"
                 L"Verif. TS interroge l'API publique de Thunderstore pour connaitre la\n"
                 L"derniere version publiee (uniquement pour les mods heberges sur\n"
                 L"thunderstore.io - Nexus/GitHub ne sont pas geres).\n\n"
@@ -2394,6 +3070,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
 
     WNDCLASSEXW wc; memset(&wc, 0, sizeof(wc));
     wc.cbSize = sizeof(wc);
+    // meme oubli corrige que pour ValModsCards : sans CS_HREDRAW|CS_VREDRAW,
+    // Windows ne reinvalide pas toute la zone client au redimensionnement,
+    // ce qui peut laisser des enfants directs (barre Ajouter/tri) ne pas se
+    // redessiner correctement apres coup.
+    wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = MainProc;
     wc.hInstance = hInst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
