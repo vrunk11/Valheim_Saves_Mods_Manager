@@ -7,8 +7,10 @@
 //  - bouton "Check+"  : ouvre le lien + horodate     "OK"   : horodate sans ouvrir
 //  - bouton "TS"      : verifie la derniere version sur Thunderstore
 //  - bouton "DL"      : telecharge le zip (demande ou l'enregistrer)
-//  - bouton "Modif."  : modifie le mod               "..."  : copier lien /
-//    localiser le DLL / ouvrir son dossier / supprimer
+//  - bouton "Modif."  : modifie le mod               "Config" : ouvre le
+//    fichier de config avec le programme associe par Windows
+//  - bouton "..."     : copier lien / localiser le DLL ou la config /
+//    ouvrir leurs dossiers / supprimer
 //  - tri via un menu deroulant + un bouton croissant/decroissant
 //  - acces rapide aux dossiers plugins / config / sauvegardes / telechargements
 //  - onglet Sauvegardes : liste des mondes et des personnages + backup
@@ -49,6 +51,8 @@
 #include <sstream>
 #include <cstdlib>
 #include <ctime>
+#include <initializer_list>   // FieldAny (lecture tolerante de valmods.json, voir LoadData)
+#include <cwctype>            // towlower (PickBestDll, comparaison de noms insensible a la casse)
 
 #include "minijson.h"
 
@@ -78,6 +82,18 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_SHOW10     1022
 #define IDC_MODPACK    1023
 #define IDC_HIDEUPTODATE 1024
+#define IDC_TAGFILTER  1025
+#define IDC_SEARCHBOX  1026
+#define IDC_SEARCHCLEAR 1027
+// cases a cocher "sur quoi chercher" (voir ModMatchesSearch) - une par
+// champ inclus dans la recherche texte libre.
+#define IDC_SEARCH_NAME     1028
+#define IDC_SEARCH_CAT      1029
+#define IDC_SEARCH_DESC     1030
+#define IDC_SEARCH_NOTE     1031
+#define IDC_SEARCH_TAGS     1032
+#define IDC_SEARCH_MODPACK  1033
+#define IDC_SEARCH_URL      1034
 #define IDC_WORLDS     1010
 #define IDC_CHARS      1011
 #define IDC_LBL1       1012
@@ -93,7 +109,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 // possibles - tres largement suffisant pour une liste de mods reelle.
 #define RA_BASE  5000
 enum { RA_WATCH = 0, RA_HIST = 1, RA_CHECK = 2, RA_MARK = 3, RA_TS = 4,
-       RA_DL = 5, RA_EDIT = 6, RA_MORE = 7, RA_COUNT = 8 };
+       RA_DL = 5, RA_EDIT = 6, RA_CONFIG = 7, RA_MORE = 8, RA_COUNT = 9 };
 
 // Un bouton de carte declenche son action via un message DIFFERE
 // (PostMessage), jamais executee directement dans le gestionnaire de
@@ -108,7 +124,8 @@ enum { RA_WATCH = 0, RA_HIST = 1, RA_CHECK = 2, RA_MARK = 3, RA_TS = 4,
 #define WM_APP_ROWACTION (WM_APP + 1)
 // actions du menu "..." (pas encodees dans l'id d'un bouton - la cible est
 // g_ctxMenuModIndex, pose au moment d'ouvrir le menu)
-enum { RA_MENU_COPY = 100, RA_MENU_LOCATE_DLL = 101, RA_MENU_OPEN_DLLDIR = 102, RA_MENU_DELETE = 103 };
+enum { RA_MENU_COPY = 100, RA_MENU_LOCATE_DLL = 101, RA_MENU_OPEN_DLLDIR = 102, RA_MENU_DELETE = 103,
+       RA_MENU_LOCATE_CONFIG = 104, RA_MENU_OPEN_CONFIG = 105 };
 
 #define IDM_OPENDATA   2001
 #define IDM_EXIT       2002
@@ -128,25 +145,94 @@ enum { RA_MENU_COPY = 100, RA_MENU_LOCATE_DLL = 101, RA_MENU_OPEN_DLLDIR = 102, 
 #define IDM_CTX_OPEN_DLLDIR 2105
 #define IDM_CTX_COPY        2106
 #define IDM_CTX_DELETE      2108
+#define IDM_CTX_LOCATE_CONFIG 2109
+#define IDM_CTX_OPEN_CONFIG   2110
 
 // boutons propres a la fenetre d'edition d'un mod
 #define IDC_E_BROWSEDLL   3001
 #define IDC_E_BROWSEICON  3002
 #define IDC_E_CLEARICON   3003
 #define IDC_E_AUTOFILL    3004
-#define IDC_E_NONTS       3005
+#define IDC_E_APISOURCE   3005
 #define IDC_E_MODPACK     3006
+#define IDC_E_BROWSECONFIG 3007
 
-#define VALMODS_VERSION "1.2.0"
+// parametres (cle API Nexus)
+#define IDM_NEXUSKEY   2011
+#define IDM_FIXLIST    2012
+
+// controles propres a la petite boite de saisie de texte generique
+// (ShowTextInputDialog - utilisee pour la cle API Nexus)
+#define IDC_TI_EDIT    3101
+
+// Version de l'application (affichee dans "A propos" et par --version).
+// A ne pas confondre avec le numero de schema du fichier valmods.json, qui
+// evolue independamment (voir SaveMods). 2.0.0 : refonte en vue "cartes",
+// integration Thunderstore (verification/telechargement), modpacks, suivi
+// de version installee. 2.1.0 : support Nexus Mods (verification/auto-
+// remplissage via cle API personnelle), chemins d'icone relatifs au dossier
+// de l'exe (portabilite - valmods.json + valmods.exe + icons\ peuvent
+// voyager ensemble). 2.2.0 : tri par source, filtre par tags (en plus du
+// modpack), bouton de tri renomme "Tri" (le glyphe suffit a indiquer le sens).
+// 2.3.0 : recherche texte libre (barre du haut), lecture retrocompatible
+// d'un valmods.json plus ancien/different (racine en tableau, noms de champ
+// alternatifs, cle "mods" absente...). 2.4.0 : cases a cocher pour choisir
+// sur quels champs porte la recherche (nom/categorie/description/note/
+// tags/modpack/lien), preference persistee.
+#define VALMODS_VERSION "2.7.1"
+
+// Numero de schema du fichier valmods.json (le champ "version" a la
+// racine) - AUCUN rapport avec VALMODS_VERSION ci-dessus (le numero de
+// version de l'appli). Source UNIQUE de verite pour ce numero : utilisee
+// a la fois par SaveMods() (qui l'ecrit) et par LoadData() (qui compare
+// oldSchemaVersion a cette meme constante pour decider si le message "ce
+// fichier vient d'un format plus ancien" doit s'afficher). Les deux
+// utilisaient auparavant des nombres litteraux distincts (14 d'un cote,
+// 12 de l'autre) qui ont fini par diverger silencieusement a un bump de
+// schema (ajout de modDir/configPath) sans que le seuil de detection soit
+// mis a jour en meme temps - d'ou cette constante commune, a incrementer
+// ICI SEULEMENT a chaque ajout/renommage de champ affectant le format.
+#define VALMODS_JSON_SCHEMA_VERSION 14
 
 // "colonnes" au sens tri uniquement desormais (il n'y a plus de tableau) :
 // meme enum reutilise par ModLess et par le menu deroulant de tri.
 enum { COL_NAME = 0, COL_CAT = 1, COL_LASTCHECK = 2, COL_AGE = 3,
-       COL_DLL = 4, COL_TSVER = 5, COL_URL = 6, COL_NOTE = 7 };
+       COL_DLL = 4, COL_TSVER = 5, COL_URL = 6, COL_NOTE = 7, COL_SOURCE = 8 };
+
+// Source utilisee pour la verification/l'auto-remplissage d'un mod.
+// API_THUNDERSTORE : comportement historique, ne fonctionne que si l'URL
+// pointe vers thunderstore.io (voir ParseThunderstoreUrl).
+// API_NEXUS : interroge l'API Nexus Mods (necessite une cle API personnelle,
+// voir g_nexusApiKey / menu Parametres) - fonctionne pour une URL
+// nexusmods.com/valheim/mods/<id>. Pas de telechargement direct (le bouton
+// DL reste desactive : l'API de telechargement de Nexus est reservee aux
+// comptes Premium), seule la verification de version est disponible.
+// API_HEXIUM : interroge l'API publique de Hexium (aucune cle requise,
+// voir valheim.hexium.gg/api/docs/) - fonctionne pour une URL
+// valheim.hexium.gg/mods/<equipe>/<nom>. Contrairement a Nexus, Hexium
+// fournit un lien de telechargement direct par version (download_url),
+// donc le bouton DL reste actif, comme pour Thunderstore (voir
+// FetchHexiumPackageEntry / DownloadHexiumZip plus bas).
+// API_NONE : desactive TS/DL pour ce mod (equivalent a l'ancienne case
+// "Non Thunderstore") - utile pour un mod dont aucune des API ne
+// convient (GitHub, page perso...).
+enum { API_THUNDERSTORE = 0, API_NEXUS = 1, API_HEXIUM = 2, API_NONE = 3 };
+
+// Compteur pour Mod::uid (voir plus bas) - jamais persiste, jamais reinitialise
+// en cours d'execution : chaque Mod construit pendant la vie du process,
+// meme temporairement (parsing JSON, editeur...), recoit un entier distinct.
+static int g_nextModUid = 1;
+static int NextModUid() { return g_nextModUid++; }
 
 // ---------------------------------------------------------------- donnees
 struct Mod {
-    std::wstring name, cat, url, changelogUrl, dllPath, iconPath, tsVersion, description, last, note;
+    std::wstring name, cat, url, changelogUrl, modDir, iconPath, tsVersion, description, last, note;
+    // Chemin vers le fichier de config du mod (typiquement un .cfg BepInEx
+    // sous BepInEx\config\, mais peut etre n'importe quel fichier texte
+    // selon le mod) - purement informatif, sert juste a le localiser/l'ouvrir
+    // rapidement (voir ActionLocateConfig/ActionOpenConfig), n'est jamais
+    // utilise pour la verification de version ou de presence.
+    std::wstring configPath;
     // Date de publication (ISO8601, telle que renvoyee par Thunderstore) de
     // la derniere version connue - sert a comparer avec la sortie de la 1.0
     // de Valheim (voir VALHEIM_10_DATE). Distincte de "last" (date a
@@ -167,11 +253,28 @@ struct Mod {
     // = pas assigne. Sert de filtre d'affichage et pour "Tout verifier" /
     // "Tout DL" (voir g_modpackFilter).
     std::wstring modpack;
-    // Coche explicite : masque TS/DL sur la carte et exclut ce mod du
-    // "Tout verifier", quel que soit ce que l'URL laisserait deviner (utile
-    // pour un mod Nexus/GitHub dont le lien ne serait pas reconnaissable).
-    bool nonThunderstore;
-    Mod() : nonThunderstore(false) {}
+    // Tags libres separes par des virgules (ex: "QoL, Building, Serveur")
+    // - un mod peut en avoir plusieurs, contrairement au modpack qui est
+    // unique. Sert uniquement de filtre d'affichage rapide (voir
+    // g_tagFilter/ModHasTag) ; aucune mise en forme particuliere n'est
+    // imposee au-dela du decoupage par virgule/point-virgule.
+    std::wstring tags;
+    // Quelle API utiliser pour la verification/l'auto-remplissage de ce mod
+    // (voir enum API_THUNDERSTORE/API_NEXUS/API_NONE ci-dessus). Remplace
+    // l'ancienne case a cocher "Non Thunderstore" (toujours lue depuis un
+    // valmods.json plus ancien pour compatibilite, voir LoadData).
+    int apiSource;
+    // Identifiant STABLE en memoire (jamais ecrit dans valmods.json), assigne
+    // une seule fois a la construction (voir g_nextModUid). Sert a retrouver
+    // LE mod exact apres un appel reseau ou un tri, au lieu de le retrouver
+    // par son nom - indispensable des qu'il existe un doublon de nom (par
+    // exemple le meme mod ajoute a deux modpacks differents comme deux
+    // fiches separees) : chercher "le mod qui s'appelle X" retomberait
+    // toujours sur la premiere fiche X trouvee, jamais la bonne en cas de
+    // doublon, et une operation groupee ("Tout verifier"/"Tout DL") traiterait
+    // deux fois la meme fiche en sautant totalement l'autre.
+    int uid;
+    Mod() : apiSource(API_THUNDERSTORE), uid(NextModUid()) {}
 };
 
 static HINSTANCE g_hInst = NULL;
@@ -182,6 +285,13 @@ static HWND  g_hTooltip = NULL;
 static HFONT g_font = NULL, g_fontBold = NULL;
 static std::vector<Mod> g_mods;
 static std::wstring g_valheimDir;
+// Cle API personnelle Nexus Mods (Compte Nexus > Parametres > API Keys),
+// necessaire pour toute requete vers l'API Nexus (contrairement a
+// Thunderstore, dont l'API publique ne demande aucune cle). Reglee via le
+// menu Parametres > "Definir la cle API Nexus...", persistee dans
+// valmods.json - c'est un secret personnel, a ne jamais partager avec le
+// fichier/le .exe si tu les envoies a un ami (voir DataFile()).
+static std::wstring g_nexusApiKey;
 // Date du dernier "Tout verifier", distincte de la date individuelle de
 // chaque mod : le bulk check ne doit JAMAIS toucher au champ "last" propre
 // a un mod (qui reste reserve a une verification personnelle, manuelle -
@@ -199,6 +309,34 @@ static bool g_showValheim10 = true;
 // Filtre d'affichage par "modpack" : vide = tous les mods, sinon ne montre
 // que ceux dont Mod::modpack correspond exactement. Persiste (voir JSON).
 static std::wstring g_modpackFilter;
+// Filtre d'affichage par tag : vide = tous les mods, sinon ne montre que
+// ceux qui ont CE tag parmi les leurs (voir Mod::tags/ModHasTag). Persiste
+// (voir JSON). Independant du filtre modpack : les deux s'appliquent
+// ensemble (voir ModMatchesFilters).
+static std::wstring g_tagFilter;
+// Recherche texte libre (barre du haut) : vide = tous les mods, sinon ne
+// montre que ceux dont un champ pertinent (nom, categorie, description,
+// note, tags, modpack, lien) contient ce texte, sans tenir compte de la
+// casse (voir ModMatchesSearch). Volontairement NON persiste dans
+// valmods.json - une recherche ponctuelle n'a pas vocation a rester active
+// silencieusement d'un lancement a l'autre (contrairement aux filtres
+// modpack/tag, delibere et plus rares a changer).
+static std::wstring g_searchQuery;
+// Sur quels champs porte la recherche ci-dessus - une case a cocher par
+// champ (barre du haut). Contrairement a g_searchQuery, CES reglages SONT
+// persistes (voir JSON) : c'est une preference d'usage ("je ne cherche
+// jamais dans les liens"), pas une recherche ponctuelle. Tous actives par
+// defaut (comportement inchange si on ne touche a rien). Si la personne
+// decoche TOUTES les cases, ModMatchesSearch retombe sur "tous les champs"
+// plutot que de renvoyer silencieusement zero resultat, ce qui serait
+// deroutant et difficile a comprendre sans lire un tooltip.
+static bool g_searchInName = true;
+static bool g_searchInCat = true;
+static bool g_searchInDesc = true;
+static bool g_searchInNote = true;
+static bool g_searchInTags = true;
+static bool g_searchInModpack = true;
+static bool g_searchInUrl = true;
 // Masque les mods dont le statut Thunderstore est "a jour" (vert) de
 // l'affichage ET de "Tout DL" (mais PAS de "Tout verifier", dont le but est
 // justement de decouvrir si le statut a change - le masquer la rendrait
@@ -218,6 +356,12 @@ static int  g_ctxMenuModIndex = -1;     // cible du menu "..." (voir ShowRowOver
 static ULONG_PTR g_gdiplusToken = 0;
 static HICON g_defaultIcon = NULL;
 static std::map<std::wstring, HICON> g_iconCache;   // chemin icone -> icone chargee (GDI+)
+// Taille des icones affichees sur les cartes (voir RefillMods) - agrandie de
+// 40 a 64px : il y a largement la place verticalement dans la carte (voir
+// CARD_H plus bas), et une icone plus grande se distingue mieux d'un mod a
+// l'autre en un coup d'oeil. Utilisee par GetOrLoadHIcon/MakeDefaultIcon
+// ci-dessous ET par RefillMods pour la taille reelle du controle a l'ecran.
+static const int CARD_ICON_SIZE = 64;
 
 // controles crees dynamiquement pour chaque carte de mod (detruits et
 // recrees a chaque RefillMods). "stretch" = la largeur est recalculee a
@@ -229,7 +373,7 @@ static int g_cardTotalHeight = 0;
 static int g_scrollPos = 0;
 
 // la taille doit rester >= au nombre d'elements pousses dans WM_CREATE.
-static HWND g_pageMods[16];  static int g_nMods = 0;
+static HWND g_pageMods[32];  static int g_nMods = 0;
 static HWND g_pageSaves[8];  static int g_nSaves = 0;
 
 // ---------------------------------------------------------------- utilitaires
@@ -275,6 +419,44 @@ static std::wstring ExeDir() {
     std::wstring s = buf;
     size_t p = s.find_last_of(L'\\');
     return (p == std::wstring::npos) ? L"." : s.substr(0, p);
+}
+// true si le chemin est absolu (lettre de lecteur "C:\" ou chemin UNC
+// "\\serveur\partage") - un chemin relatif ("icons\foo.png") ne l'est pas.
+static bool IsAbsolutePath(const std::wstring& p) {
+    if (p.size() >= 2 && p[1] == L':') return true;                 // "C:\..."
+    if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\') return true; // "\\serveur\..."
+    return false;
+}
+// Transforme un chemin d'icone TEL QUE STOCKE dans valmods.json en chemin
+// utilisable pour charger le fichier : un chemin relatif (ex: "icons\\
+// Foo-Bar.png") est resolu par rapport au dossier de l'exe, un chemin
+// absolu est utilise tel quel (icone choisie hors du dossier de l'appli -
+// ne pourra de toute facon pas voyager avec le .exe si on l'envoie a un
+// ami, voir StoreIconPath ci-dessous qui essaie d'eviter ce cas).
+static std::wstring ResolveIconPath(const std::wstring& stored) {
+    if (stored.empty() || IsAbsolutePath(stored)) return stored;
+    return ExeDir() + L"\\" + stored;
+}
+// Chemin a ENREGISTRER dans valmods.json pour une icone : si le fichier se
+// trouve deja quelque part sous le dossier de l'exe (typiquement dans
+// icons\, mais pas force), on stocke un chemin RELATIF a l'exe - ainsi
+// valmods.json + valmods.exe + le dossier icons\ peuvent etre envoyes tels
+// quels a quelqu'un d'autre sans que les icones cassent (un chemin absolu
+// du genre "C:\Users\Toi\Pictures\mod.png" ne survivrait pas au transfert,
+// vu que ce dossier n'existe pas chez le destinataire). Si le fichier est
+// ailleurs, on garde le chemin absolu tel quel (rien d'autre a faire).
+static std::wstring StoreIconPath(const std::wstring& fullPath) {
+    if (fullPath.empty()) return fullPath;
+    std::wstring dir = ExeDir();
+    std::wstring prefix = dir + L"\\";
+    // Comparaison insensible a la casse sur les N premiers caracteres
+    // (lstrcmpiW ne prend pas de longueur, d'ou la sous-chaine prealable) -
+    // Windows ne distinguant pas la casse des lettres de lecteur/chemins.
+    if (fullPath.size() > prefix.size() &&
+        lstrcmpiW(fullPath.substr(0, prefix.size()).c_str(), prefix.c_str()) == 0) {
+        return fullPath.substr(prefix.size());
+    }
+    return fullPath;
 }
 static std::wstring GetTextOf(HWND h) {
     int n = GetWindowTextLengthW(h);
@@ -443,7 +625,7 @@ static HICON LoadScaledIconFromFile(const std::wstring& path, int size) {
     delete src;
     return b.ToIcon();
 }
-// Icone (40x40, taille des cartes) pour ce chemin, chargee et mise en cache
+// Icone (CARD_ICON_SIZE x CARD_ICON_SIZE, taille des cartes) pour ce chemin, chargee et mise en cache
 // au premier appel ; un chemin vide ou illisible retombe sur l'icone par
 // defaut PARTAGEE (g_defaultIcon) SANS la mettre en cache, pour ne jamais
 // risquer de detruire deux fois le meme HICON au nettoyage final (voir
@@ -454,9 +636,13 @@ static HICON LoadScaledIconFromFile(const std::wstring& path, int size) {
 // de l'appli : negligeable pour le nombre d'icones qu'un usage normal genere).
 static HICON GetOrLoadHIcon(const std::wstring& path) {
     if (path.empty()) return g_defaultIcon;
+    // le cache est cle par le chemin STOCKE (potentiellement relatif) : un
+    // meme mod repasse toujours le meme chemin, la resolution (voir
+    // ResolveIconPath) n'a besoin d'etre faite qu'au moment du chargement
+    // reel du fichier.
     std::map<std::wstring, HICON>::iterator it = g_iconCache.find(path);
     if (it != g_iconCache.end()) return it->second;
-    HICON hi = LoadScaledIconFromFile(path, 40);
+    HICON hi = LoadScaledIconFromFile(ResolveIconPath(path), CARD_ICON_SIZE);
     if (!hi) return g_defaultIcon;
     g_iconCache[path] = hi;
     return hi;
@@ -617,34 +803,83 @@ static std::wstring DetectValheim() {
 //
 //   valmods.json
 //   {
-//     "version": 10,
+//     "version": 14,
 //     "valheimDir": "D:\\SteamLibrary\\steamapps\\common\\Valheim",
+//     "nexusApiKey": "",
 //     "lastGlobalCheck": "2026-08-19 14:30",
 //     "showValheim10Check": true,
 //     "modpackFilter": "",
+//     "tagFilter": "",
 //     "hideUpToDate": false,
+//     "searchInName": true, "searchInCategory": true, "searchInDescription": true,
+//     "searchInNote": true, "searchInTags": true, "searchInModpack": true,
+//     "searchInUrl": true,
 //     "mods": [
 //       { "name": "...", "category": "...", "url": "...",
-//         "changelogUrl": "...", "dllPath": "...", "iconPath": "...",
+//         "changelogUrl": "...",
+//         "modDir": "D:\\...\\BepInEx\\plugins\\NomDuMod",
+//         "configPath": "D:\\...\\BepInEx\\config\\NomDuMod.cfg",
+//         "iconPath": "icons\\Mod.png",
 //         "tsVersion": "1.3.0", "tsLatestDate": "2026-03-26T21:26:57Z",
 //         "installedVersion": "1.3.0",
 //         "description": "...", "modpack": "Serveur du vendredi",
+//         "tags": "QoL, Building",
+//         "apiSource": "thunderstore",   // "thunderstore" / "nexus" / "hexium" / "none"
 //         "nonThunderstore": false,
 //         "lastCheck": "2026-08-19 14:30", "note": "..." }
 //     ]
 //   }
+// "modDir" remplace l'ancien "dllPath" (v13 et anterieur) : celui-ci
+// pointait vers le fichier .dll exact, celui-la pointe vers le DOSSIER
+// d'installation du mod (le DLL a l'interieur est retrouve automatiquement,
+// voir ResolveModDll). Un valmods.json v13 est lu normalement : si
+// "modDir" est absent, "dllPath" (ou ses anciens alias "dll"/"path"/
+// "dllFile") est repris et, s'il pointe vers un fichier plutot qu'un
+// dossier, son dossier parent est utilise (voir ParseModValue).
 static std::wstring DataFile()   { return ExeDir() + L"\\valmods.json"; }
 static std::wstring LegacyFile() { return ExeDir() + L"\\valmods.tsv"; }
 
+// "thunderstore" / "nexus" / "hexium" / "none" - lisible a la main dans le
+// JSON, contrairement a un simple entier.
+static const char* ApiSourceName(int s) {
+    switch (s) {
+        case API_NEXUS:  return "nexus";
+        case API_HEXIUM: return "hexium";
+        case API_NONE:   return "none";
+        default:         return "thunderstore";
+    }
+}
+static int ApiSourceFromName(const std::string& s) {
+    if (s == "nexus")  return API_NEXUS;
+    if (s == "hexium") return API_HEXIUM;
+    if (s == "none")   return API_NONE;
+    return API_THUNDERSTORE;
+}
 static void SaveMods() {
     std::string out;
     out += "{\n";
-    out += "  \"version\": 10,\n";
+    out += "  \"version\": " + std::to_string(VALMODS_JSON_SCHEMA_VERSION) + ",\n";
     out += "  \"valheimDir\": " + mj::quote(W2U(g_valheimDir)) + ",\n";
+    // Cle API Nexus : un secret personnel. Rappel volontaire ici pour que
+    // quiconope ouvre valmods.json a la main (ou lise ce fichier) tombe
+    // dessus : a retirer/vider avant d'envoyer valmods.json a quelqu'un
+    // d'autre (voir menu Parametres > "Definir la cle API Nexus...").
+    out += "  \"nexusApiKey\": " + mj::quote(W2U(g_nexusApiKey)) + ",\n";
     out += "  \"lastGlobalCheck\": " + mj::quote(W2U(g_lastGlobalCheck)) + ",\n";
     out += std::string("  \"showValheim10Check\": ") + (g_showValheim10 ? "true" : "false") + ",\n";
     out += "  \"modpackFilter\": " + mj::quote(W2U(g_modpackFilter)) + ",\n";
+    out += "  \"tagFilter\": " + mj::quote(W2U(g_tagFilter)) + ",\n";
     out += std::string("  \"hideUpToDate\": ") + (g_hideUpToDate ? "true" : "false") + ",\n";
+    // Cases "sur quoi chercher" (voir g_searchIn*/ModMatchesSearch) - une
+    // preference d'usage persistee, contrairement au texte de recherche
+    // lui-meme (g_searchQuery), volontairement non enregistre (voir plus haut).
+    out += std::string("  \"searchInName\": ")     + (g_searchInName ? "true" : "false") + ",\n";
+    out += std::string("  \"searchInCategory\": ") + (g_searchInCat ? "true" : "false") + ",\n";
+    out += std::string("  \"searchInDescription\": ") + (g_searchInDesc ? "true" : "false") + ",\n";
+    out += std::string("  \"searchInNote\": ")     + (g_searchInNote ? "true" : "false") + ",\n";
+    out += std::string("  \"searchInTags\": ")     + (g_searchInTags ? "true" : "false") + ",\n";
+    out += std::string("  \"searchInModpack\": ")  + (g_searchInModpack ? "true" : "false") + ",\n";
+    out += std::string("  \"searchInUrl\": ")      + (g_searchInUrl ? "true" : "false") + ",\n";
     out += "  \"mods\": [\n";
     for (size_t i = 0; i < g_mods.size(); ++i) {
         const Mod& m = g_mods[i];
@@ -653,14 +888,25 @@ static void SaveMods() {
         out += "      \"category\":         " + mj::quote(W2U(m.cat))              + ",\n";
         out += "      \"url\":              " + mj::quote(W2U(m.url))              + ",\n";
         out += "      \"changelogUrl\":     " + mj::quote(W2U(m.changelogUrl))     + ",\n";
-        out += "      \"dllPath\":          " + mj::quote(W2U(m.dllPath))          + ",\n";
+        out += "      \"modDir\":           " + mj::quote(W2U(m.modDir))            + ",\n";
+        out += "      \"configPath\":       " + mj::quote(W2U(m.configPath))        + ",\n";
+        // Chemin d'icone : relatif au dossier de l'exe quand possible (voir
+        // StoreIconPath), donc PORTABLE si on envoie valmods.json +
+        // valmods.exe + le dossier icons\ ensemble a un ami.
         out += "      \"iconPath\":         " + mj::quote(W2U(m.iconPath))         + ",\n";
         out += "      \"tsVersion\":        " + mj::quote(W2U(m.tsVersion))        + ",\n";
         out += "      \"tsLatestDate\":     " + mj::quote(W2U(m.tsLatestDate))     + ",\n";
         out += "      \"installedVersion\": " + mj::quote(W2U(m.installedVersion)) + ",\n";
         out += "      \"description\":      " + mj::quote(W2U(m.description))      + ",\n";
         out += "      \"modpack\":          " + mj::quote(W2U(m.modpack))          + ",\n";
-        out += std::string("      \"nonThunderstore\": ") + (m.nonThunderstore ? "true" : "false") + ",\n";
+        out += "      \"tags\":             " + mj::quote(W2U(m.tags))             + ",\n";
+        out += std::string("      \"apiSource\":       ") + mj::quote(ApiSourceName(m.apiSource)) + ",\n";
+        // "nonThunderstore" garde en ecriture uniquement pour qu'un ancien
+        // valmods.json (versions < 2.1, avant l'ajout de Nexus) reste
+        // lisible si jamais ce fichier est rouvert par cette meme copie de
+        // l'appli apres un retour en arriere ; ignore a la lecture des que
+        // "apiSource" est present (voir LoadData).
+        out += std::string("      \"nonThunderstore\": ") + (m.apiSource == API_NONE ? "true" : "false") + ",\n";
         out += "      \"lastCheck\":        " + mj::quote(W2U(m.last))             + ",\n";
         out += "      \"note\":             " + mj::quote(W2U(m.note))             + "\n";
         out += (i + 1 < g_mods.size()) ? "    },\n" : "    }\n";
@@ -700,6 +946,116 @@ static void ImportLegacyTsv(const std::string& raw) {
     }
 }
 
+// Lit une chaine dans v en essayant plusieurs noms de cle possibles, dans
+// l'ordre - le premier trouve (non vide) l'emporte. Sert a la RETRO-
+// COMPATIBILITE avec un valmods.json cree par une version de l'appli dont
+// on ne connait pas exactement le schema (ex: la toute premiere version
+// personnelle de quelqu'un, avant que ce fichier ne documente le format
+// "officiel" ci-dessus) : plutot que de perdre silencieusement un champ
+// dont le nom aurait change, on tente quelques graphies plausibles.
+static std::wstring FieldAny(const mj::Value& v, std::initializer_list<const char*> keys) {
+    for (std::initializer_list<const char*>::const_iterator it = keys.begin(); it != keys.end(); ++it) {
+        const mj::Value* f = v.find(*it);
+        if (f && f->type == mj::STR && !f->str.empty()) return Clean(U2W(f->str));
+    }
+    return L"";
+}
+// Lit un booleen a la racine, avec une valeur par defaut explicite si le
+// champ est absent (ou d'un type inattendu) - utilise pour les reglages
+// dont l'absence doit signifier "comportement habituel" plutot que
+// "false" (ex: les cases "sur quoi chercher", voir g_searchIn*, absentes
+// d'un valmods.json plus ancien mais qui doivent quand meme démarrer TOUTES
+// cochees).
+static bool BoolField(const mj::Value& root, const char* key, bool def) {
+    const mj::Value* f = root.find(key);
+    return (f && f->type == mj::BOOL) ? f->b : def;
+}
+
+// Construit un Mod a partir d'un element de la liste "mods" - qu'il s'agisse
+// d'un objet complet (format habituel) ou d'une simple chaine (URL nue, au
+// cas ou un tout premier format de ValMods ait stocke une liste de liens
+// plutot que des objets). Renvoie un Mod vide (nom et url vides) si
+// l'element n'est exploitable d'aucune de ces deux facons.
+static Mod ParseModValue(const mj::Value& v) {
+    Mod m;
+    if (v.type == mj::STR) {
+        // element = juste un lien ; on s'en sert aussi comme nom provisoire,
+        // modifiable ensuite dans l'editeur (Modifier).
+        m.url = Clean(U2W(v.str));
+        m.name = m.url;
+        return m;
+    }
+    if (v.type != mj::OBJ) return m;   // ni objet ni chaine : rien a en tirer
+
+    m.name         = FieldAny(v, {"name", "modName", "title"});
+    m.cat          = FieldAny(v, {"category", "cat", "categorie", "author", "auteur"});
+    m.url          = FieldAny(v, {"url", "link", "pageUrl", "modUrl", "page"});
+    m.changelogUrl = FieldAny(v, {"changelogUrl", "historyUrl", "changelog", "history"});
+    // "modDir" (nouveau, v14+) est le dossier d'installation du mod ;
+    // l'ancien "dllPath" (v13 et anterieur, ainsi que ses alias "dll"/
+    // "path"/"dllFile") pointait vers le fichier .dll exact - on le
+    // reprend en repli, et s'il s'agit visiblement d'un chemin de FICHIER
+    // (extension .dll) on ne garde que son dossier parent, puisque c'est
+    // desormais ca qui est attendu (voir ResolveModDll).
+    m.modDir       = FieldAny(v, {"modDir", "modFolder", "installDir"});
+    if (m.modDir.empty()) {
+        std::wstring legacyDll = FieldAny(v, {"dllPath", "dll", "path", "dllFile"});
+        if (!legacyDll.empty()) {
+            size_t n = legacyDll.size();
+            bool looksLikeDllFile = (n > 4 && lstrcmpiW(legacyDll.c_str() + n - 4, L".dll") == 0);
+            if (looksLikeDllFile) {
+                size_t p = legacyDll.find_last_of(L"\\/");
+                m.modDir = (p == std::wstring::npos) ? L"" : legacyDll.substr(0, p);
+            } else {
+                m.modDir = legacyDll;   // deja un dossier (ou chemin ambigu) : on le garde tel quel
+            }
+        }
+    }
+    m.configPath   = FieldAny(v, {"configPath", "config", "cfgPath", "configFile"});
+    m.iconPath     = FieldAny(v, {"iconPath", "icon", "image", "iconFile"});
+    m.tsVersion    = FieldAny(v, {"tsVersion", "latestVersion", "lastVersion"});
+    m.tsLatestDate = FieldAny(v, {"tsLatestDate", "latestDate", "publishedDate"});
+    m.installedVersion = FieldAny(v, {"installedVersion", "installed", "myVersion", "currentVersion"});
+    m.description  = FieldAny(v, {"description", "desc", "summary"});
+    m.modpack      = FieldAny(v, {"modpack", "pack", "group", "collection"});
+    m.tags         = FieldAny(v, {"tags", "tag", "labels"});
+    m.last         = FieldAny(v, {"lastCheck", "last", "lastChecked", "checkedAt", "dateChecked"});
+    m.note         = FieldAny(v, {"note", "notes", "comment", "remark", "remarque"});
+
+    // "apiSource" (nouveau) prioritaire ; repli sur l'ancienne case
+    // "nonThunderstore" pour un valmods.json cree par une version anterieure
+    // a l'ajout de Nexus (false -> API Thunderstore comme avant, true ->
+    // desactive).
+    const mj::Value* apiSrc = v.find("apiSource");
+    if (apiSrc && apiSrc->type == mj::STR) {
+        m.apiSource = ApiSourceFromName(apiSrc->str);
+    } else {
+        const mj::Value* nts = v.find("nonThunderstore");
+        m.apiSource = (nts && nts->type == mj::BOOL && nts->b) ? API_NONE : API_THUNDERSTORE;
+    }
+
+    // Un valmods.json plus ancien peut contenir un chemin d'icone ABSOLU qui
+    // se trouve deja sous le dossier de l'exe (ex: telecharge par un ancien
+    // Auto-remplir) : on le relativise a la volee pour beneficier de la
+    // portabilite (voir StoreIconPath) sans que l'utilisateur ait a rouvrir
+    // chaque mod dans l'editeur.
+    m.iconPath = StoreIconPath(m.iconPath);
+    return m;
+}
+
+// Cherche la liste des mods sous plusieurs noms de cle possibles a la
+// racine (format habituel : "mods" ; quelques variantes plausibles pour un
+// tres ancien fichier). Renvoie NULL si aucune des cles connues ne contient
+// un tableau.
+static const mj::Value* FindModsArray(const mj::Value& root) {
+    static const char* candidates[] = { "mods", "modList", "modlist", "list", "items" };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        const mj::Value* v = root.find(candidates[i]);
+        if (v && v->type == mj::ARR) return v;
+    }
+    return NULL;
+}
+
 static void LoadData() {
     g_mods.clear();
     g_valheimDir.clear();
@@ -707,40 +1063,99 @@ static void LoadData() {
 
     if (ReadAllBytes(DataFile(), raw)) {
         mj::Value root;
-        if (mj::parse(raw, root) && root.type == mj::OBJ) {
-            g_valheimDir = U2W(root.s("valheimDir"));
-            g_lastGlobalCheck = U2W(root.s("lastGlobalCheck"));
-            const mj::Value* show10 = root.find("showValheim10Check");
-            g_showValheim10 = (show10 && show10->type == mj::BOOL) ? show10->b : true;
-            g_modpackFilter = U2W(root.s("modpackFilter"));
-            const mj::Value* hideUp = root.find("hideUpToDate");
-            g_hideUpToDate = (hideUp && hideUp->type == mj::BOOL && hideUp->b);
-            const mj::Value* mods = root.find("mods");
-            if (mods && mods->type == mj::ARR) {
-                for (size_t i = 0; i < mods->arr.size(); ++i) {
-                    const mj::Value& v = mods->arr[i];
-                    if (v.type != mj::OBJ) continue;
-                    Mod m;
-                    m.name         = Clean(U2W(v.s("name")));
-                    m.cat          = Clean(U2W(v.s("category")));
-                    m.url          = Clean(U2W(v.s("url")));
-                    m.changelogUrl = Clean(U2W(v.s("changelogUrl")));
-                    m.dllPath      = Clean(U2W(v.s("dllPath")));
-                    m.iconPath     = Clean(U2W(v.s("iconPath")));
-                    m.tsVersion    = Clean(U2W(v.s("tsVersion")));
-                    m.tsLatestDate = Clean(U2W(v.s("tsLatestDate")));
-                    m.installedVersion = Clean(U2W(v.s("installedVersion")));
-                    m.description  = Clean(U2W(v.s("description")));
-                    m.modpack      = Clean(U2W(v.s("modpack")));
-                    const mj::Value* nts = v.find("nonThunderstore");
-                    m.nonThunderstore = (nts && nts->type == mj::BOOL && nts->b);
-                    m.last         = Clean(U2W(v.s("lastCheck")));
-                    m.note         = Clean(U2W(v.s("note")));
+        bool parsed = mj::parse(raw, root);
+        // Un fichier valide mais de FORME inattendue (racine directement un
+        // tableau de mods, schema plus ancien...) n'est PAS un fichier
+        // corrompu - seule une erreur de syntaxe JSON authentique merite le
+        // traitement "fichier corrompu, mis de cote" ci-dessous. Distinguer
+        // les deux evite de renommer en .bad (et donc de faire "disparaitre"
+        // aux yeux de l'appli) un fichier par ailleurs parfaitement lisible,
+        // juste parce qu'il ne correspond pas exactement au schema attendu.
+        if (parsed && (root.type == mj::OBJ || root.type == mj::ARR)) {
+            // Schema d'origine du fichier (0 si absent - fichier d'une
+            // version qui ne stockait pas encore ce champ, ou racine sous
+            // forme de simple tableau) : sert uniquement a decider si le
+            // message de mise a jour ci-dessous doit s'afficher, PAS a
+            // choisir comment lire les champs (chaque champ est de toute
+            // facon lu independamment, avec repli sur une valeur par defaut
+            // s'il est absent - voir ParseModValue/FieldAny).
+            int oldSchemaVersion = 0;
+            const mj::Value* modsNode = NULL;
+
+            if (root.type == mj::OBJ) {
+                const mj::Value* verNode = root.find("version");
+                if (verNode && verNode->type == mj::NUM) oldSchemaVersion = (int)verNode->num;
+
+                g_valheimDir = U2W(root.s("valheimDir"));
+                g_nexusApiKey = Clean(U2W(root.s("nexusApiKey")));
+                g_lastGlobalCheck = U2W(root.s("lastGlobalCheck"));
+                const mj::Value* show10 = root.find("showValheim10Check");
+                g_showValheim10 = (show10 && show10->type == mj::BOOL) ? show10->b : true;
+                g_modpackFilter = U2W(root.s("modpackFilter"));
+                g_tagFilter = U2W(root.s("tagFilter"));
+                const mj::Value* hideUp = root.find("hideUpToDate");
+                g_hideUpToDate = (hideUp && hideUp->type == mj::BOOL && hideUp->b);
+
+                // Cases "sur quoi chercher" : absentes (ancien fichier) =
+                // TRUE par defaut, pour ne rien exclure d'une recherche tant
+                // que la personne n'a pas explicitement decoche quoi que ce
+                // soit (voir g_searchIn*).
+                g_searchInName    = BoolField(root, "searchInName", true);
+                g_searchInCat     = BoolField(root, "searchInCategory", true);
+                g_searchInDesc    = BoolField(root, "searchInDescription", true);
+                g_searchInNote    = BoolField(root, "searchInNote", true);
+                g_searchInTags    = BoolField(root, "searchInTags", true);
+                g_searchInModpack = BoolField(root, "searchInModpack", true);
+                g_searchInUrl     = BoolField(root, "searchInUrl", true);
+
+                modsNode = FindModsArray(root);
+            } else {
+                // root.type == ARR : le fichier EST directement la liste de
+                // mods (format "plat", sans objet englobant) - aucun reglage
+                // racine a lire, tout part des valeurs par defaut.
+                modsNode = &root;
+            }
+
+            if (modsNode) {
+                for (size_t i = 0; i < modsNode->arr.size(); ++i) {
+                    Mod m = ParseModValue(modsNode->arr[i]);
                     if (!m.name.empty() || !m.url.empty()) g_mods.push_back(m);
                 }
             }
+
+            // Fichier d'un schema plus ancien (ou sans numero de schema du
+            // tout) : on le signale une seule fois - la sauvegarde qui suit
+            // (SaveMods() en fin de fonction) le fera passer au schema
+            // actuel, donc ce message ne reapparaitra plus aux lancements
+            // suivants. Une copie de l'original est gardee a cote (.premigration)
+            // au cas ou la lecture ci-dessus aurait rate quelque chose.
+            // Seuil compare a VALMODS_JSON_SCHEMA_VERSION (PAS un nombre
+            // litteral en dur) : sinon ce seuil reste fige a l'ancienne
+            // valeur du schema a chaque bump ulterieur (ex: apiSource en
+            // v13, modDir/configPath en v14) et cesse de declencher le
+            // message/backup pour des fichiers pourtant plus vieux que le
+            // format actuel - ce qui s'est deja produit une fois ici.
+            if (root.type == mj::ARR || oldSchemaVersion < VALMODS_JSON_SCHEMA_VERSION) {
+                std::wstring bak = DataFile() + L".premigration";
+                if (!FileExists(bak)) CopyFileW(DataFile().c_str(), bak.c_str(), FALSE);
+                wchar_t countMsg[64];
+                wsprintfW(countMsg, L"%d mod(s) repris.", (int)g_mods.size());
+                std::wstring msg =
+                    L"valmods.json vient d'un format plus ancien (ou different) de ValMods.\n\n";
+                msg += countMsg;
+                msg +=
+                    L"\nIl va etre enregistre au format actuel : les champs qui manquaient\n"
+                    L"ont recu des valeurs par defaut, rien n'a ete supprime.\n\n"
+                    L"Une copie de l'original a ete gardee a cote, au cas ou :\n"
+                    L"valmods.json.premigration\n\n"
+                    L"Si des mods de ta liste manquent malgre tout ci-dessous, tu peux\n"
+                    L"comparer avec cette copie et les rajouter a la main (bouton Ajouter).";
+                MessageBoxW(NULL, msg.c_str(), L"ValMods", MB_OK | MB_ICONINFORMATION);
+            }
         } else {
-            // fichier corrompu : on le met de cote au lieu de l'ecraser
+            // erreur de syntaxe JSON authentique (ou racine d'un type qui ne
+            // peut de toute facon rien contenir, ex: juste un nombre/texte
+            // seul) : on met le fichier de cote plutot que de l'ecraser.
             std::wstring bad = DataFile() + L".bad";
             DeleteFileW(bad.c_str());
             MoveFileW(DataFile().c_str(), bad.c_str());
@@ -773,9 +1188,14 @@ static bool ModLess(const Mod& a, const Mod& b) {
             if (r == 0) r = lstrcmpiW(a.name.c_str(), b.name.c_str());
             break;
         }
-        case COL_DLL: r = lstrcmpiW(a.dllPath.c_str(), b.dllPath.c_str()); break;
+        case COL_DLL: r = lstrcmpiW(a.modDir.c_str(), b.modDir.c_str()); break;
         case COL_TSVER: r = lstrcmpiW(a.tsVersion.c_str(), b.tsVersion.c_str()); break;
         case COL_URL: r = lstrcmpiW(a.url.c_str(), b.url.c_str()); break;
+        case COL_SOURCE: {
+            r = (a.apiSource > b.apiSource) ? 1 : (a.apiSource < b.apiSource ? -1 : 0);
+            if (r == 0) r = lstrcmpiW(a.name.c_str(), b.name.c_str());
+            break;
+        }
         default:      r = lstrcmpiW(a.note.c_str(), b.note.c_str()); break;
     }
     return g_sortAsc ? (r < 0) : (r > 0);
@@ -785,6 +1205,72 @@ static bool ModLess(const Mod& a, const Mod& b) {
 static std::wstring DllFileName(const std::wstring& path) {
     size_t p = path.find_last_of(L"\\/");
     return (p == std::wstring::npos) ? path : path.substr(p + 1);
+}
+// Cherche tous les .dll sous un dossier, jusqu'a maxDepth niveaux de
+// sous-dossiers (0 = seulement le dossier lui-meme) - la plupart des mods
+// BepInEx extraient leur DLL directement dans le dossier du mod, mais
+// certains le nichent un ou deux niveaux plus bas (ex: un sous-dossier
+// "plugin" ou une structure de repo copiee telle quelle). On s'arrete a
+// depth<=2 et a 64 fichiers trouves pour ne pas partir scanner tout un
+// disque si l'utilisateur pointe par erreur sur un dossier bien plus haut.
+static void FindDllsInDirRec(const std::wstring& dir, int depth, std::vector<std::wstring>& out) {
+    if (depth < 0 || out.size() >= 64) return;
+    WIN32_FIND_DATAW fd;
+    std::wstring pattern = dir + L"\\*";
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        std::wstring full = dir + L"\\" + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (depth > 0) FindDllsInDirRec(full, depth - 1, out);
+        } else {
+            size_t n = wcslen(fd.cFileName);
+            if (n > 4 && lstrcmpiW(fd.cFileName + n - 4, L".dll") == 0) out.push_back(full);
+        }
+        if (out.size() >= 64) break;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+static std::vector<std::wstring> FindDllsInDir(const std::wstring& dir) {
+    std::vector<std::wstring> out;
+    if (!DirExists(dir)) return out;
+    FindDllsInDirRec(dir, 2, out);
+    return out;
+}
+// Choisit LE dll a considerer comme "celui du mod" parmi tous ceux trouves
+// sous le dossier : priorite a un nom de fichier qui contient le nom du mod
+// (ou l'inverse), sinon le premier par ordre alphabetique - un choix
+// arbitraire mais stable (evite qu'il change de mod en mod selon l'ordre
+// du systeme de fichiers).
+static std::wstring PickBestDll(const Mod& m, const std::vector<std::wstring>& dlls) {
+    if (dlls.empty()) return L"";
+    if (dlls.size() == 1) return dlls[0];
+    std::wstring nameLower = m.name;
+    std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::towlower);
+    std::wstring best; 
+    for (size_t i = 0; i < dlls.size(); ++i) {
+        std::wstring fnLower = DllFileName(dlls[i]);
+        std::transform(fnLower.begin(), fnLower.end(), fnLower.begin(), ::towlower);
+        if (!nameLower.empty() &&
+            (fnLower.find(nameLower) != std::wstring::npos || nameLower.find(fnLower) != std::wstring::npos)) {
+            if (best.empty() || lstrcmpiW(dlls[i].c_str(), best.c_str()) < 0) best = dlls[i];
+        }
+    }
+    if (!best.empty()) return best;
+    best = dlls[0];
+    for (size_t i = 1; i < dlls.size(); ++i)
+        if (lstrcmpiW(dlls[i].c_str(), best.c_str()) < 0) best = dlls[i];
+    return best;
+}
+// Resout le(s) DLL du dossier associe a un mod (voir Mod::modDir). countOut,
+// si fourni, recoit le nombre total de DLL trouves (utile pour distinguer
+// "aucun DLL dans ce dossier" de "plusieurs DLL, on en a choisi un").
+static std::wstring ResolveModDll(const Mod& m, size_t* countOut = NULL) {
+    if (m.modDir.empty()) { if (countOut) *countOut = 0; return L""; }
+    std::vector<std::wstring> dlls = FindDllsInDir(m.modDir);
+    if (countOut) *countOut = dlls.size();
+    return PickBestDll(m, dlls);
 }
 static std::wstring GetDllVersionString(const std::wstring& path) {
     DWORD handle = 0;
@@ -810,20 +1296,31 @@ static std::wstring GetDllVersionString(const std::wstring& path) {
 // donc s'appuyer uniquement dessus donnait des faux "jamais verifie".
 static std::wstring GetEffectiveInstalledVersion(const Mod& m) {
     if (!m.installedVersion.empty()) return m.installedVersion;
-    if (m.dllPath.empty()) return L"";
-    return GetDllVersionString(m.dllPath);
+    std::wstring dll = ResolveModDll(m);
+    if (dll.empty()) return L"";
+    return GetDllVersionString(dll);
 }
-// missingOut, si fourni, est mis a true si un DLL est renseigne mais introuvable
+// missingOut, si fourni, est mis a true si un probleme concret existe
+// (dossier renseigne mais introuvable, ou dossier existant sans aucun DLL
+// dedans).
 static std::wstring DllStatusText(const Mod& m, bool* missingOut) {
     if (missingOut) *missingOut = false;
-    if (m.dllPath.empty()) return L"-";
-    std::wstring fn = DllFileName(m.dllPath);
-    if (!FileExists(m.dllPath)) {
+    if (m.modDir.empty()) return L"-";
+    if (!DirExists(m.modDir)) {
         if (missingOut) *missingOut = true;
-        return L"manquant : " + fn;
+        return L"dossier introuvable";
     }
+    size_t count = 0;
+    std::wstring dll = ResolveModDll(m, &count);
+    if (dll.empty()) {
+        if (missingOut) *missingOut = true;
+        return L"aucun DLL dans le dossier";
+    }
+    std::wstring fn = DllFileName(dll);
     std::wstring ver = GetEffectiveInstalledVersion(m);
-    return ver.empty() ? fn : (fn + L" (v" + ver + L")");
+    std::wstring txt = ver.empty() ? fn : (fn + L" (v" + ver + L")");
+    if (count > 1) txt += L" [+" + std::to_wstring(count - 1) + L"]";
+    return txt;
 }
 
 // ---------------------------------------------------------------- Thunderstore
@@ -896,9 +1393,13 @@ static bool VersionLess(const std::wstring& a, const std::wstring& b) {
 // remplir la RAM sans limite.
 // Timeouts volontairement courts (resolution/connexion 5s, envoi/reception 8s)
 // pour ne pas bloquer l'interface trop longtemps en cas de reseau absent.
+// extraHeaders (optionnel) : lignes d'en-tete supplementaires separees par
+// "\r\n" (ex: L"apikey: xxxx\r\n") - utilise par l'API Nexus, qui exige une
+// cle personnelle en en-tete (contrairement a Thunderstore, dont l'API
+// publique ne demande aucune authentification).
 static bool HttpGetBytes(const std::wstring& host, const std::wstring& path,
                          std::string& outBody, DWORD& outStatus, std::wstring& errOut,
-                         size_t maxBytes = 0)
+                         size_t maxBytes = 0, const std::wstring& extraHeaders = L"")
 {
     outBody.clear(); outStatus = 0; errOut.clear();
     HINTERNET hSession = WinHttpOpen(L"ValMods (Windows)", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -921,7 +1422,9 @@ static bool HttpGetBytes(const std::wstring& host, const std::wstring& path,
         return false;
     }
 
-    BOOL ok = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+    BOOL ok = WinHttpSendRequest(hRequest,
+        extraHeaders.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : extraHeaders.c_str(),
+        extraHeaders.empty() ? 0 : (DWORD)-1L,
         WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
     if (ok) ok = WinHttpReceiveResponse(hRequest, NULL);
     if (!ok) {
@@ -978,6 +1481,38 @@ static std::wstring SanitizeFileName(const std::wstring& s) {
         out += ok ? c : L'_';
     }
     return out.empty() ? L"icon" : out;
+}
+// Copie un fichier d'icone choisi par l'utilisateur (n'importe ou sur le
+// disque) dans icons\ a cote de l'exe, pour que le chemin puisse ensuite
+// etre stocke en RELATIF (voir StoreIconPath) - condition necessaire pour
+// que valmods.json + valmods.exe + icons\ puissent voyager ensemble vers
+// un autre PC sans que les icones se retrouvent cassees (un chemin absolu
+// du style "C:\Users\Toi\Pictures\mod.png" ne pointerait vers rien chez un
+// ami). Renvoie le chemin ABSOLU de la copie, ou "" en cas d'echec.
+static std::wstring CopyIconIntoIconsDir(const std::wstring& srcPath) {
+    if (srcPath.empty() || !FileExists(srcPath)) return L"";
+    std::wstring dir = ExeDir() + L"\\icons";
+    MakeDirs(dir);
+    size_t p = srcPath.find_last_of(L"\\/");
+    std::wstring base = SanitizeFileName((p == std::wstring::npos) ? srcPath : srcPath.substr(p + 1));
+    std::wstring dest = dir + L"\\" + base;
+    // deja la copie visee elle-meme (icone deja importee precedemment) :
+    // rien a refaire.
+    if (lstrcmpiW(dest.c_str(), srcPath.c_str()) == 0) return dest;
+    if (!FileExists(dest))
+        return CopyFileW(srcPath.c_str(), dest.c_str(), FALSE) ? dest : L"";
+    // un autre fichier porte deja ce nom dans icons\ : on ajoute un
+    // suffixe numerique jusqu'a trouver un nom libre.
+    std::wstring stem = base, ext;
+    size_t dot = base.find_last_of(L'.');
+    if (dot != std::wstring::npos) { stem = base.substr(0, dot); ext = base.substr(dot); }
+    for (int n = 1; n < 1000; ++n) {
+        wchar_t suf[16]; wsprintfW(suf, L"-%d", n);
+        std::wstring cand = dir + L"\\" + stem + suf + ext;
+        if (!FileExists(cand))
+            return CopyFileW(srcPath.c_str(), cand.c_str(), FALSE) ? cand : L"";
+    }
+    return L"";
 }
 
 // Recupere et parse le JSON du package Thunderstore correspondant a l'URL
@@ -1089,16 +1624,15 @@ static TsAutofillResult FetchThunderstoreAutofill(const std::wstring& modUrl) {
 
     r.name = Clean(U2W(f.root.s("name")));
 
-    // "categories" n'existe pas sur cet endpoint (confirme sur une reponse
-    // reelle) - ce bloc ne trouvera donc jamais rien pour l'instant, garde
-    // au cas ou Thunderstore l'ajoute un jour ; ca ne casse rien si absent.
-    const mj::Value* cats = f.root.find("categories");
-    if (cats && cats->type == mj::ARR) {
-        for (size_t i = 0; i < cats->arr.size(); ++i) {
-            if (cats->arr[i].type != mj::STR) continue;
-            if (!r.category.empty()) r.category += L", ";
-            r.category += U2W(cats->arr[i].str);
-        }
+    // Thunderstore n'expose pas de liste de categories textuelle sur cet
+    // endpoint (confirme sur une reponse reelle) - en revanche "owner" (le
+    // namespace/l'equipe qui a publie le mod) EST present, c'est ce qu'on
+    // utilise pour remplir le champ "Categorie / auteur" de l'editeur.
+    // Repli sur le namespace extrait de l'URL si jamais "owner" manquait.
+    r.category = Clean(U2W(f.root.s("owner")));
+    if (r.category.empty()) {
+        std::wstring ns, nm;
+        if (ParseThunderstoreUrl(modUrl, ns, nm)) r.category = ns;
     }
 
     std::wstring latest;
@@ -1130,7 +1664,10 @@ static TsAutofillResult FetchThunderstoreAutofill(const std::wstring& modUrl) {
                 std::wstring dir = ExeDir() + L"\\icons";
                 MakeDirs(dir);
                 std::wstring dest = dir + L"\\" + SanitizeFileName(ns) + L"-" + SanitizeFileName(nm) + L".png";
-                if (WriteAllBytes(dest, bytes)) r.localIconPath = dest;
+                // stocke en RELATIF (voir StoreIconPath) : le fichier est deja
+                // sous ExeDir()\icons, donc portable si on envoie valmods.json
+                // + valmods.exe + icons\ a quelqu'un d'autre.
+                if (WriteAllBytes(dest, bytes)) r.localIconPath = StoreIconPath(dest);
             }
             // l'icone est un bonus : si le telechargement echoue, on continue
             // quand meme avec le reste des champs plutot que de tout faire echouer.
@@ -1171,6 +1708,428 @@ static bool DownloadThunderstoreZip(const std::wstring& ns, const std::wstring& 
     if (bytes.empty()) { errOut = L"Fichier telecharge vide."; return false; }
     if (!WriteAllBytes(destPath, bytes)) { errOut = L"Impossible d'ecrire le fichier sur le disque."; return false; }
     return true;
+}
+
+// ---------------------------------------------------------------- Hexium
+// Verification en ligne via l'API publique de Hexium (aucune cle requise,
+// voir valheim.hexium.gg/api/docs/ - c'est une API "compatible
+// Thunderstore" au sens du format de package, mais PAS la meme forme
+// d'endpoint : contrairement a Thunderstore (un GET par mod, qui renvoie
+// directement le mod demande), Hexium n'expose qu'un seul endpoint de
+// LISTE COMPLETE :
+//   GET https://valheim.hexium.gg/api/v1/package/
+// qui renvoie un tableau JSON de TOUS les mods Valheim (nom, equipe/owner,
+// package_url, et un tableau "versions" par mod, la plus recente en tete,
+// avec version_number/description/icon/download_url/date_created...). Il
+// n'y a pas d'endpoint "un seul mod par equipe/nom" comme sur Thunderstore -
+// juste "/api/v1/package/{uuid4}/" (par UUID, qu'on n'a pas a partir d'une
+// simple URL de page mod) et "/api/v1/package-metrics/{namespace}/{name}/"
+// (metriques seules, pas de version). On recupere donc la liste complete et
+// on cherche dedans le mod dont owner/name correspondent a l'URL - mise en
+// cache quelques minutes (g_hexiumPackageCache) pour eviter de retelecharger
+// tout le catalogue a chaque mod verifie pendant un "Tout verifier".
+// Fournit un download_url direct par version : contrairement a Nexus, le
+// telechargement direct (bouton DL) reste donc disponible pour Hexium.
+
+// Extrait equipe/nom d'une URL de page Hexium, ex:
+// https://valheim.hexium.gg/mods/Azumatt/AzuExtendedPlayerInventory -> team=Azumatt, name=AzuExtendedPlayerInventory
+static bool ParseHexiumUrl(const std::wstring& url, std::wstring& team, std::wstring& name) {
+    if (url.find(L"hexium.gg") == std::wstring::npos) return false;
+    size_t marker = url.find(L"/mods/");
+    if (marker == std::wstring::npos) return false;
+    std::wstring rest = url.substr(marker + 6);
+    size_t q = rest.find_first_of(L"?#");
+    if (q != std::wstring::npos) rest = rest.substr(0, q);
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    for (size_t i = 0; i <= rest.size(); ++i) {
+        if (i == rest.size() || rest[i] == L'/') {
+            if (i > start) parts.push_back(rest.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    if (parts.size() < 2) return false;
+    team = parts[0];
+    name = parts[1];
+    return true;
+}
+
+// Cache en memoire (jamais persiste) du catalogue complet Hexium, pour
+// eviter un telechargement de plusieurs centaines de mods par appel quand
+// "Tout verifier"/"Completer la liste" enchainent des dizaines de mods
+// Hexium d'affilee. Duree de vie volontairement courte (5 minutes) : assez
+// pour couvrir une seule operation groupee, pas assez pour risquer de
+// travailler sur des donnees perimees d'une session a l'autre.
+static mj::Value g_hexiumPackageCache;
+static bool  g_hexiumCacheValid = false;
+static DWORD g_hexiumCacheTick = 0;
+static const DWORD HEXIUM_CACHE_TTL_MS = 5 * 60 * 1000;
+
+static bool FetchHexiumPackageList(std::wstring& errOut) {
+    DWORD now = GetTickCount();
+    if (g_hexiumCacheValid && (now - g_hexiumCacheTick) < HEXIUM_CACHE_TTL_MS) return true;
+
+    std::string body; DWORD status = 0;
+    if (!HttpGetBytes(L"valheim.hexium.gg", L"/api/v1/package/", body, status, errOut,
+                       64u * 1024u * 1024u)) {   // 64 Mo, garde-fou (catalogue complet)
+        if (errOut.empty()) errOut = L"Echec de la requete.";
+        return false;
+    }
+    if (status != 200) {
+        wchar_t b[64]; wsprintfW(b, L"Hexium a repondu avec le code %lu.", (unsigned long)status);
+        errOut = b;
+        return false;
+    }
+    mj::Value root;
+    if (!mj::parse(body, root) || root.type != mj::ARR) {
+        errOut = L"Reponse Hexium illisible (format inattendu).";
+        return false;
+    }
+    g_hexiumPackageCache = root;
+    g_hexiumCacheValid = true;
+    g_hexiumCacheTick = now;
+    return true;
+}
+
+// Recupere (via le cache ci-dessus) l'entree du catalogue Hexium correspondant
+// a l'URL d'un mod. Partagee par CheckHexiumVersion et FetchHexiumAutofill,
+// comme FetchThunderstorePackage pour Thunderstore.
+struct HexiumFetchResult {
+    bool ok;
+    bool isHexium;
+    std::wstring error;
+    mj::Value entry;
+    HexiumFetchResult() : ok(false), isHexium(false) {}
+};
+static HexiumFetchResult FetchHexiumPackageEntry(const std::wstring& modUrl) {
+    HexiumFetchResult r;
+    std::wstring team, name;
+    if (!ParseHexiumUrl(modUrl, team, name)) return r;   // isHexium reste false
+    r.isHexium = true;
+
+    std::wstring err;
+    if (!FetchHexiumPackageList(err)) {
+        r.error = err.empty() ? L"Echec de la requete." : err;
+        return r;
+    }
+    for (size_t i = 0; i < g_hexiumPackageCache.arr.size(); ++i) {
+        const mj::Value& e = g_hexiumPackageCache.arr[i];
+        std::wstring eOwner = U2W(e.s("owner"));
+        std::wstring eName  = U2W(e.s("name"));
+        if (lstrcmpiW(eOwner.c_str(), team.c_str()) == 0 && lstrcmpiW(eName.c_str(), name.c_str()) == 0) {
+            r.entry = e;
+            r.ok = true;
+            return r;
+        }
+    }
+    r.error = L"Mod introuvable dans le catalogue Hexium (lien casse, mod retire, "
+              L"ou equipe/nom incorrect dans l'URL).";
+    return r;
+}
+// Comme FindLatestEntry pour Thunderstore, mais lit "versions[0]" (tableau,
+// la plus recente en tete - confirme par le schema de l'API) plutot qu'un
+// objet "latest" separe, forme propre a l'API Hexium.
+static const mj::Value* FindHexiumLatestVersion(const mj::Value& entry, std::wstring& outVersion) {
+    outVersion.clear();
+    const mj::Value* versions = entry.find("versions");
+    if (!versions || versions->type != mj::ARR || versions->arr.empty()) return NULL;
+    const mj::Value& v0 = versions->arr[0];
+    outVersion = U2W(v0.s("version_number"));
+    if (outVersion.empty()) return NULL;
+    return &v0;
+}
+
+struct HexiumCheckResult {
+    bool ok;
+    bool isHexium;
+    bool deprecated;
+    std::wstring latestVersion;
+    std::wstring latestDate;
+    std::wstring description;
+    std::wstring downloadUrl;   // lien direct vers le zip de cette version
+    std::wstring error;
+    HexiumCheckResult() : ok(false), isHexium(false), deprecated(false) {}
+};
+static HexiumCheckResult CheckHexiumVersion(const std::wstring& modUrl) {
+    HexiumCheckResult r;
+    HexiumFetchResult f = FetchHexiumPackageEntry(modUrl);
+    r.isHexium = f.isHexium;
+    if (!f.isHexium) return r;
+    if (!f.ok) { r.error = f.error; return r; }
+
+    std::wstring latest;
+    const mj::Value* v0 = FindHexiumLatestVersion(f.entry, latest);
+    if (!v0) {
+        r.error = L"Numero de version introuvable dans la reponse (mod retire ou reponse degradee).";
+        return r;
+    }
+    r.latestVersion = latest;
+    r.description  = Clean(U2W(v0->s("description")));
+    r.latestDate   = Clean(U2W(v0->s("date_created")));
+    r.downloadUrl  = U2W(v0->s("download_url"));
+
+    const mj::Value* dep = f.entry.find("is_deprecated");
+    r.deprecated = (dep && dep->type == mj::BOOL && dep->b);
+    r.ok = true;
+    return r;
+}
+
+// Recupere nom / categorie (owner) / derniere version / icone depuis Hexium
+// pour pre-remplir l'editeur de mod (bouton "Auto-remplir"). Pas de
+// changelogUrl : contrairement a Thunderstore, l'API Hexium n'expose pas de
+// page de changelog separee dans ce schema (le champ reste simplement vide,
+// comme pour Nexus - voir ModMissingAutofillableField).
+struct HexiumAutofillResult {
+    bool ok;
+    bool isHexium;
+    std::wstring error;
+    std::wstring name, category, latestVersion, latestDate, localIconPath, description;
+    HexiumAutofillResult() : ok(false), isHexium(false) {}
+};
+static HexiumAutofillResult FetchHexiumAutofill(const std::wstring& modUrl) {
+    HexiumAutofillResult r;
+    HexiumFetchResult f = FetchHexiumPackageEntry(modUrl);
+    r.isHexium = f.isHexium;
+    if (!f.isHexium) return r;
+    if (!f.ok) { r.error = f.error; return r; }
+
+    r.name = Clean(U2W(f.entry.s("name")));
+    r.category = Clean(U2W(f.entry.s("owner")));
+    if (r.category.empty()) {
+        std::wstring team, nm;
+        if (ParseHexiumUrl(modUrl, team, nm)) r.category = team;
+    }
+
+    std::wstring latest;
+    const mj::Value* v0 = FindHexiumLatestVersion(f.entry, latest);
+    if (!v0) {
+        r.error = L"Numero de version introuvable dans la reponse (mod retire ou reponse degradee).";
+        return r;
+    }
+    r.latestVersion = latest;
+    r.latestDate = Clean(U2W(v0->s("date_created")));
+    r.description = Clean(U2W(v0->s("description")));
+
+    std::wstring iconUrl = U2W(v0->s("icon"));
+    if (!iconUrl.empty()) {
+        std::wstring host, path;
+        if (SplitHttpsUrl(iconUrl, host, path)) {
+            std::string bytes; DWORD status = 0; std::wstring err;
+            if (HttpGetBytes(host, path, bytes, status, err) && status == 200 && !bytes.empty()) {
+                std::wstring team, nm;
+                ParseHexiumUrl(modUrl, team, nm);   // deja valide via f.isHexium
+                std::wstring dir = ExeDir() + L"\\icons";
+                MakeDirs(dir);
+                // suffixe "-hexium" pour ne jamais ecraser une icone
+                // Thunderstore/Nexus deja telechargee sous le meme
+                // owner/nom (peu probable, mais gratuit a eviter).
+                std::wstring dest = dir + L"\\" + SanitizeFileName(team) + L"-" + SanitizeFileName(nm) + L"-hexium.png";
+                if (WriteAllBytes(dest, bytes)) r.localIconPath = StoreIconPath(dest);
+            }
+            // bonus non bloquant, comme pour Thunderstore : un echec de
+            // telechargement d'icone ne fait pas echouer tout le reste.
+        }
+    }
+
+    r.ok = true;
+    return r;
+}
+
+// Telecharge le zip via le download_url renvoye directement par l'API Hexium
+// pour cette version (pas de pattern d'URL a reconstruire a la main, comme
+// pour Thunderstore - Hexium le fournit deja tout fait dans la reponse).
+static bool DownloadHexiumZip(const std::wstring& downloadUrl, const std::wstring& destPath, std::wstring& errOut) {
+    std::wstring host, path;
+    if (!SplitHttpsUrl(downloadUrl, host, path)) {
+        errOut = L"Lien de telechargement Hexium invalide ou manquant.";
+        return false;
+    }
+    std::string bytes; DWORD status = 0;
+    const size_t maxBytes = 200u * 1024u * 1024u;   // 200 Mo, garde-fou de securite
+    if (!HttpGetBytes(host, path, bytes, status, errOut, maxBytes)) {
+        if (errOut.empty()) errOut = L"Echec du telechargement.";
+        return false;
+    }
+    if (status == 404) {
+        errOut = L"Fichier introuvable sur Hexium (peut-etre retire entre temps).";
+        return false;
+    }
+    if (status != 200) {
+        wchar_t b[64]; wsprintfW(b, L"Hexium a repondu avec le code %lu.", (unsigned long)status);
+        errOut = b;
+        return false;
+    }
+    if (bytes.empty()) { errOut = L"Fichier telecharge vide."; return false; }
+    if (!WriteAllBytes(destPath, bytes)) { errOut = L"Impossible d'ecrire le fichier sur le disque."; return false; }
+    return true;
+}
+
+// ---------------------------------------------------------------- Nexus Mods
+// Verification en ligne via l'API officielle de Nexus Mods :
+//   GET https://api.nexusmods.com/v1/games/{domaine}/mods/{id}.json
+//   en-tete requis : apikey: <cle personnelle>
+// Contrairement a Thunderstore, l'API Nexus exige une cle API personnelle
+// (gratuite - Compte Nexus > Parametres > API Keys), reglee dans l'appli via
+// le menu Parametres > "Definir la cle API Nexus..." (voir g_nexusApiKey).
+// Le domaine de jeu Nexus pour Valheim est "valheim" (voir NEXUS_GAME_DOMAIN
+// ci-dessous, au cas ou Nexus le changerait un jour).
+// Pas de telechargement direct : l'API "generate_download_link" de Nexus est
+// reservee aux comptes Premium (ou a un flux NXM complique a reproduire
+// fidelement ici) - le bouton DL reste desactive pour les mods Nexus (voir
+// RefillMods), seule la verification de version est proposee.
+static const wchar_t* NEXUS_GAME_DOMAIN = L"valheim";
+
+// Extrait l'identifiant numerique d'une URL de page Nexus, ex:
+// https://www.nexusmods.com/valheim/mods/1234 -> modId=1234
+// https://www.nexusmods.com/valheim/mods/1234?tab=files -> idem
+static bool ParseNexusUrl(const std::wstring& url, std::wstring& modId) {
+    if (url.find(L"nexusmods.com") == std::wstring::npos) return false;
+    size_t marker = url.find(L"/mods/");
+    if (marker == std::wstring::npos) return false;
+    std::wstring rest = url.substr(marker + 6);
+    size_t end = 0;
+    while (end < rest.size() && rest[end] >= L'0' && rest[end] <= L'9') ++end;
+    if (end == 0) return false;
+    modId = rest.substr(0, end);
+    return true;
+}
+
+struct NexusFetchResult {
+    bool ok;
+    bool isNexus;
+    std::wstring error;
+    mj::Value root;
+    NexusFetchResult() : ok(false), isNexus(false) {}
+};
+// Partagee par CheckNexusVersion et FetchNexusAutofill, comme
+// FetchThunderstorePackage pour Thunderstore.
+static NexusFetchResult FetchNexusMod(const std::wstring& modUrl) {
+    NexusFetchResult r;
+    std::wstring modId;
+    if (!ParseNexusUrl(modUrl, modId)) return r;   // isNexus reste false
+    r.isNexus = true;
+
+    if (g_nexusApiKey.empty()) {
+        r.error = L"Aucune cle API Nexus renseignee (menu Parametres > "
+                  L"\"Definir la cle API Nexus...\"). Cle personnelle et gratuite, "
+                  L"disponible sur ton compte Nexus (Parametres > API Keys).";
+        return r;
+    }
+
+    std::wstring path = L"/v1/games/" + std::wstring(NEXUS_GAME_DOMAIN) + L"/mods/" + modId + L".json";
+    std::wstring headers = L"apikey: " + g_nexusApiKey + L"\r\nAccept: application/json\r\n";
+    std::string body; DWORD status = 0; std::wstring err;
+    if (!HttpGetBytes(L"api.nexusmods.com", path, body, status, err, 0, headers)) {
+        r.error = err.empty() ? L"Echec de la requete." : err;
+        return r;
+    }
+    if (status == 401) {
+        r.error = L"Cle API Nexus refusee (401) - verifie qu'elle est correcte "
+                  L"dans Parametres > \"Definir la cle API Nexus...\".";
+        return r;
+    }
+    if (status == 404) {
+        r.error = L"Mod introuvable sur Nexus (lien casse, mod retire, ou "
+                  L"identifiant incorrect dans l'URL).";
+        return r;
+    }
+    if (status != 200) {
+        wchar_t b[64]; wsprintfW(b, L"Nexus a repondu avec le code %lu.", (unsigned long)status);
+        r.error = b;
+        return r;
+    }
+    if (!mj::parse(body, r.root) || r.root.type != mj::OBJ) {
+        r.error = L"Reponse Nexus illisible (format inattendu).";
+        return r;
+    }
+    r.ok = true;
+    return r;
+}
+
+struct NexusCheckResult {
+    bool ok;
+    bool isNexus;
+    bool unavailable;   // mod retire/cache par son auteur ("available": false)
+    std::wstring latestVersion;
+    std::wstring latestDate;
+    std::wstring description;
+    std::wstring error;
+    NexusCheckResult() : ok(false), isNexus(false), unavailable(false) {}
+};
+static NexusCheckResult CheckNexusVersion(const std::wstring& modUrl) {
+    NexusCheckResult r;
+    NexusFetchResult f = FetchNexusMod(modUrl);
+    r.isNexus = f.isNexus;
+    if (!f.isNexus) return r;
+    if (!f.ok) { r.error = f.error; return r; }
+
+    // Le champ "version" est la version declaree par l'auteur du mod (pas
+    // un numero de fichier individuel) - equivalent le plus proche de
+    // "latest.version_number" cote Thunderstore pour une simple comparaison.
+    r.latestVersion = Clean(U2W(f.root.s("version")));
+    if (r.latestVersion.empty()) {
+        r.error = L"Numero de version introuvable dans la reponse Nexus.";
+        return r;
+    }
+    r.latestDate = Clean(U2W(f.root.s("updated_time")));
+    r.description = Clean(U2W(f.root.s("summary")));
+
+    const mj::Value* avail = f.root.find("available");
+    r.unavailable = (avail && avail->type == mj::BOOL && !avail->b);
+    r.ok = true;
+    return r;
+}
+
+// Recupere nom / description / derniere version / icone depuis Nexus pour
+// pre-remplir l'editeur (bouton "Auto-remplir"). Meme principe que
+// FetchThunderstoreAutofill : l'icone est telechargee dans icons\ a cote de
+// l'exe et le chemin stocke est RELATIF (voir StoreIconPath).
+struct NexusAutofillResult {
+    bool ok;
+    bool isNexus;
+    std::wstring error;
+    std::wstring name, latestVersion, latestDate, localIconPath, description;
+    NexusAutofillResult() : ok(false), isNexus(false) {}
+};
+static NexusAutofillResult FetchNexusAutofill(const std::wstring& modUrl) {
+    NexusAutofillResult r;
+    NexusFetchResult f = FetchNexusMod(modUrl);
+    r.isNexus = f.isNexus;
+    if (!f.isNexus) return r;
+    if (!f.ok) { r.error = f.error; return r; }
+
+    r.name = Clean(U2W(f.root.s("name")));
+    r.latestVersion = Clean(U2W(f.root.s("version")));
+    if (r.latestVersion.empty()) {
+        r.error = L"Numero de version introuvable dans la reponse Nexus.";
+        return r;
+    }
+    r.latestDate = Clean(U2W(f.root.s("updated_time")));
+    r.description = Clean(U2W(f.root.s("summary")));
+
+    std::wstring iconUrl = U2W(f.root.s("picture_url"));
+    if (!iconUrl.empty()) {
+        std::wstring host, path;
+        if (SplitHttpsUrl(iconUrl, host, path)) {
+            std::string bytes; DWORD status = 0; std::wstring err;
+            if (HttpGetBytes(host, path, bytes, status, err) && status == 200 && !bytes.empty()) {
+                std::wstring modId; ParseNexusUrl(modUrl, modId);   // deja valide via f.isNexus
+                std::wstring dir = ExeDir() + L"\\icons";
+                MakeDirs(dir);
+                // extension d'apres picture_url (jpg le plus souvent chez Nexus)
+                std::wstring ext = L".jpg";
+                size_t dot = path.find_last_of(L'.');
+                if (dot != std::wstring::npos && path.size() - dot <= 5) ext = path.substr(dot);
+                std::wstring dest = dir + L"\\nexus-" + modId + ext;
+                if (WriteAllBytes(dest, bytes)) r.localIconPath = StoreIconPath(dest);
+            }
+            // l'icone est un bonus, comme pour Thunderstore : un echec ne
+            // doit pas faire echouer tout l'auto-remplissage.
+        }
+    }
+
+    r.ok = true;
+    return r;
 }
 
 // Texte + categorie de couleur pour l'etat Thunderstore (integre a la ligne
@@ -1245,7 +2204,9 @@ static std::wstring BuildDetailsLine(const Mod& m) {
     if (!m.cat.empty()) s += m.cat + L"  |  ";
     s += L"Verif : " + (m.last.empty() ? std::wstring(L"jamais") : DaysText(m.last));
     s += L"  |  DLL : " + DllStatusText(m, NULL);
-    s += L"  |  TS : " + TsStatusText(m, NULL);
+    const wchar_t* srcLabel = (m.apiSource == API_NEXUS) ? L"Nexus" :
+        (m.apiSource == API_HEXIUM) ? L"Hexium" : (m.apiSource == API_NONE) ? L"-" : L"TS";
+    s += L"  |  " + std::wstring(srcLabel) + L" : " + TsStatusText(m, NULL);
     if (g_showValheim10) s += L"  |  " + Valheim10StatusText(m, NULL);
     return s;
 }
@@ -1327,7 +2288,7 @@ static void RedrawCardsHost() {
 }
 // Meme constat, mais pour toute la fenetre : certains controles enfants
 // directs de la fenetre principale (le menu de tri, les boutons Ajouter/
-// Croissant...) peuvent eux aussi ne pas se redessiner correctement apres
+// Tri...) peuvent eux aussi ne pas se redessiner correctement apres
 // une action, exactement pour la meme raison que le panneau de cartes.
 // Plutot que de traquer un par un chaque endroit oublie, on force tout
 // depuis la racine - legerement plus couteux, mais fiable.
@@ -1357,12 +2318,84 @@ static void UpdateCardsScrollInfo() {
 static bool ModMatchesPack(const Mod& m) {
     return g_modpackFilter.empty() || m.modpack == g_modpackFilter;
 }
+// Decoupe Mod::tags (texte libre separe par virgules ou points-virgules) en
+// tags individuels, nettoyes (Trim) et non vides. Partage par ModHasTag et
+// par la reconstruction du menu deroulant de filtre (RefillTagCombo).
+static std::vector<std::wstring> SplitTags(const std::wstring& raw) {
+    std::vector<std::wstring> out;
+    std::wstring cur;
+    for (size_t i = 0; i <= raw.size(); ++i) {
+        if (i == raw.size() || raw[i] == L',' || raw[i] == L';') {
+            std::wstring t = Trim(cur);
+            if (!t.empty()) out.push_back(t);
+            cur.clear();
+        } else {
+            cur += raw[i];
+        }
+    }
+    return out;
+}
+// true si ce mod porte CE tag precis (comparaison insensible a la casse,
+// comme le reste des comparaisons textuelles de l'appli - voir lstrcmpiW).
+static bool ModHasTag(const Mod& m, const std::wstring& tag) {
+    std::vector<std::wstring> ts = SplitTags(m.tags);
+    for (size_t i = 0; i < ts.size(); ++i)
+        if (lstrcmpiW(ts[i].c_str(), tag.c_str()) == 0) return true;
+    return false;
+}
+// Un mod correspond au tag actuellement filtre (ou aucun filtre actif).
+static bool ModMatchesTag(const Mod& m) {
+    return g_tagFilter.empty() || ModHasTag(m, g_tagFilter);
+}
+// true si "needle" apparait dans "haystack", sans tenir compte de la casse.
+// Conversion en minuscules manuelle (juste A-Z, largement suffisant ici -
+// noms/descriptions de mods restent tres majoritairement en ASCII) plutot
+// que de dependre de locales.
+static std::wstring ToLowerAscii(const std::wstring& s) {
+    std::wstring out = s;
+    for (size_t i = 0; i < out.size(); ++i)
+        if (out[i] >= L'A' && out[i] <= L'Z') out[i] = (wchar_t)(out[i] - L'A' + L'a');
+    return out;
+}
+static bool ContainsCI(const std::wstring& haystack, const std::wstring& needle) {
+    if (needle.empty()) return true;
+    return ToLowerAscii(haystack).find(ToLowerAscii(needle)) != std::wstring::npos;
+}
+// Un mod correspond a la recherche en cours (ou aucune recherche active) si
+// le texte tape se retrouve dans l'un des champs COCHES (voir g_searchIn*,
+// cases a cocher de la barre du haut). Si aucune case n'est cochee, on
+// cherche quand meme dans tous les champs (voir le commentaire pres de
+// g_searchInName) plutot que de bloquer silencieusement tout resultat.
+static bool AnySearchFieldEnabled() {
+    return g_searchInName || g_searchInCat || g_searchInDesc || g_searchInNote ||
+           g_searchInTags || g_searchInModpack || g_searchInUrl;
+}
+static bool ModMatchesSearch(const Mod& m) {
+    if (g_searchQuery.empty()) return true;
+    bool restrict_ = AnySearchFieldEnabled();
+    if ((!restrict_ || g_searchInName)    && ContainsCI(m.name, g_searchQuery))        return true;
+    if ((!restrict_ || g_searchInCat)     && ContainsCI(m.cat, g_searchQuery))          return true;
+    if ((!restrict_ || g_searchInDesc)    && ContainsCI(m.description, g_searchQuery))  return true;
+    if ((!restrict_ || g_searchInNote)    && ContainsCI(m.note, g_searchQuery))         return true;
+    if ((!restrict_ || g_searchInTags)    && ContainsCI(m.tags, g_searchQuery))         return true;
+    if ((!restrict_ || g_searchInModpack) && ContainsCI(m.modpack, g_searchQuery))      return true;
+    if ((!restrict_ || g_searchInUrl)     && ContainsCI(m.url, g_searchQuery))          return true;
+    return false;
+}
+// Modpack + tag + recherche : les filtres que les operations groupees
+// ("Tout verifier"/"Tout DL") doivent respecter, contrairement a "Masquer a
+// jour" qui, lui, ne doit pas empecher "Tout verifier" de decouvrir un
+// changement de statut (voir ModPassesFilters plus bas et le commentaire
+// pres de g_hideUpToDate).
+static bool ModMatchesFilters(const Mod& m) {
+    return ModMatchesPack(m) && ModMatchesTag(m) && ModMatchesSearch(m);
+}
 // Filtre complet utilise pour l'affichage des cartes ET pour "Tout DL" :
-// modpack + masquage des mods a jour. PAS utilise par "Tout verifier", qui
-// doit justement pouvoir decouvrir un changement de statut (voir le
+// modpack + tag + masquage des mods a jour. PAS utilise par "Tout verifier",
+// qui doit justement pouvoir decouvrir un changement de statut (voir le
 // commentaire pres de g_hideUpToDate).
 static bool ModPassesFilters(const Mod& m) {
-    if (!ModMatchesPack(m)) return false;
+    if (!ModMatchesFilters(m)) return false;
     if (g_hideUpToDate) {
         int tsCat = 0;
         TsStatusText(m, &tsCat);
@@ -1371,16 +2404,18 @@ static bool ModPassesFilters(const Mod& m) {
     return true;
 }
 
-// Fait defiler le panneau pour amener ce mod (retrouve par son nom, apres
-// tri ET filtrage) dans la zone visible. Sans ca, ajouter/modifier un mod
+// Fait defiler le panneau pour amener ce mod (retrouve par son identifiant
+// stable, voir Mod::uid - PAS par son nom, qui peut etre duplique si le meme
+// mod a ete ajoute a plusieurs modpacks comme deux fiches separees) apres
+// tri ET filtrage, dans la zone visible. Sans ca, ajouter/modifier un mod
 // dont le nom le fait trier loin de la position actuelle de defilement
 // donne l'impression que "rien ne s'est passe" - la carte existe bien,
 // mais hors champ, sans aucune indication a l'ecran.
-static void ScrollToMod(const std::wstring& name) {
-    if (!g_hCardsHost || name.empty()) return;
+static void ScrollToMod(int uid) {
+    if (!g_hCardsHost || uid <= 0) return;
     int gIdx = -1;
     for (size_t k = 0; k < g_mods.size(); ++k)
-        if (g_mods[k].name == name) { gIdx = (int)k; break; }
+        if (g_mods[k].uid == uid) { gIdx = (int)k; break; }
     if (gIdx < 0) return;
     // position parmi les cartes VISIBLES, pas l'index brut dans g_mods : un
     // filtre actif peut avoir saute des mods, decalant les positions ecran.
@@ -1431,25 +2466,61 @@ static void RefillModpackCombo() {
     SendMessageW(combo, CB_SETCURSEL, sel, 0);
 }
 
+// Reconstruit le menu deroulant de filtre "Tag" a partir de tous les tags
+// distincts presents dans g_mods (chaque Mod::tags decoupe via SplitTags),
+// en tete "Tous les tags". Meme logique que RefillModpackCombo.
+static void RefillTagCombo() {
+    HWND combo = g_hMain ? GetDlgItem(g_hMain, IDC_TAGFILTER) : NULL;
+    if (!combo) return;
+    std::vector<std::wstring> tags;
+    for (size_t i = 0; i < g_mods.size(); ++i) {
+        std::vector<std::wstring> ts = SplitTags(g_mods[i].tags);
+        for (size_t j = 0; j < ts.size(); ++j) {
+            bool found = false;
+            for (size_t k = 0; k < tags.size(); ++k)
+                if (lstrcmpiW(tags[k].c_str(), ts[j].c_str()) == 0) { found = true; break; }
+            if (!found) tags.push_back(ts[j]);
+        }
+    }
+    std::sort(tags.begin(), tags.end());
+
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)L"Tous les tags");
+    for (size_t i = 0; i < tags.size(); ++i)
+        SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)tags[i].c_str());
+
+    int sel = 0;
+    if (!g_tagFilter.empty()) {
+        for (size_t i = 0; i < tags.size(); ++i)
+            if (lstrcmpiW(tags[i].c_str(), g_tagFilter.c_str()) == 0) { sel = (int)(i + 1); break; }
+        if (sel == 0) g_tagFilter.clear();   // le tag filtre a disparu
+    }
+    SendMessageW(combo, CB_SETCURSEL, sel, 0);
+}
+
 static void RefillMods() {
     std::stable_sort(g_mods.begin(), g_mods.end(), ModLess);
     RefillModpackCombo();   // peut reinitialiser g_modpackFilter si obsolete
+    RefillTagCombo();       // peut reinitialiser g_tagFilter si obsolete
     ClearCards();
     g_visibleIndices.clear();
 
-    const int iconX = 10, textX = 60;
+    // iconX/textX : l'icone (CARD_ICON_SIZE) est centree verticalement dans
+    // la carte, le texte commence juste apres avec une marge confortable.
+    const int iconX = 10, textX = iconX + CARD_ICON_SIZE + 16;   // 90 a 64px
     int row = 0;   // position parmi les cartes VISIBLES (pas l'index dans g_mods)
     for (size_t i = 0; i < g_mods.size(); ++i) {
         const Mod& m = g_mods[i];
         if (!ModPassesFilters(m)) continue;
         g_visibleIndices.push_back((int)i);
         int y = row * CARD_H;
+        int iconY = y + (CARD_H - CARD_ICON_SIZE) / 2;
 
         HWND icon = CreateWindowExW(0, L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_ICON | SS_CENTERIMAGE,
-            iconX, y + 12, 40, 40, g_hCardsHost, NULL, g_hInst, NULL);
+            iconX, iconY, CARD_ICON_SIZE, CARD_ICON_SIZE, g_hCardsHost, NULL, g_hInst, NULL);
         SendMessageW(icon, STM_SETICON, (WPARAM)GetOrLoadHIcon(m.iconPath), 0);
-        { CardChild cc; cc.hwnd = icon; cc.x = iconX; cc.y = y + 12; cc.w = 40; cc.h = 40;
+        { CardChild cc; cc.hwnd = icon; cc.x = iconX; cc.y = iconY; cc.w = CARD_ICON_SIZE; cc.h = CARD_ICON_SIZE;
           cc.stretch = false; g_cardChildren.push_back(cc); }
 
         MkCardStatic(m.name, textX, y + 8, 400, 20,
@@ -1481,23 +2552,42 @@ static void RefillMods() {
         HWND bTs    = MkCardButton(id + RA_TS,    L"\u26A1",    bx, by, bw, bh); bx += bw + gap;  // eclair  Thunderstore
         HWND bDl    = MkCardButton(id + RA_DL,    L"\u2193",    bx, by, bw, bh); bx += bw + gap;  // v(bas)  telecharger
         HWND bEdit  = MkCardButton(id + RA_EDIT,  L"\u270E",    bx, by, bw, bh); bx += bw + gap;  // crayon  modifier
+        HWND bConfig= MkCardButton(id + RA_CONFIG,L"\u2699",    bx, by, bw, bh); bx += bw + gap;  // roue dentee  config
         HWND bMore  = MkCardButton(id + RA_MORE,  L"...",       bx, by, bw, bh); bx += bw + gap;  // ...  plus d'actions
 
         AddTip(bWatch, L"Watch : ouvre la page du mod dans le navigateur");
         AddTip(bHist,  L"Historique : ouvre la page des changements / versions du mod");
         AddTip(bCheck, L"Check+ : ouvre la page du mod ET note la date de verification du jour");
         AddTip(bMark,  L"Verifie : note la date de verification SANS ouvrir de lien - deja verifie ailleurs ?");
-        if (m.nonThunderstore) {
+        if (m.apiSource == API_NONE) {
             EnableWindow(bTs, FALSE);
             EnableWindow(bDl, FALSE);
-            AddTip(bTs, L"Thunderstore : desactive - ce mod est marque \"Non Thunderstore\" (voir Modifier)");
-            AddTip(bDl, L"Telecharger : desactive - ce mod est marque \"Non Thunderstore\" (voir Modifier)");
+            AddTip(bTs, L"Verification : desactivee - source \"Aucune\" (voir Modifier)");
+            AddTip(bDl, L"Telecharger : desactive - source \"Aucune\" (voir Modifier)");
+        } else if (m.apiSource == API_NEXUS) {
+            EnableWindow(bDl, FALSE);   // pas de telechargement direct sans compte Nexus Premium
+            AddTip(bTs, L"Nexus : interroge l'API Nexus Mods pour connaitre la derniere version publiee");
+            AddTip(bDl, L"Telecharger : non disponible pour Nexus (API de telechargement reservee "
+                        L"aux comptes Premium) - utilise Watch pour aller chercher le fichier a la main");
+        } else if (m.apiSource == API_HEXIUM) {
+            AddTip(bTs, L"Hexium : interroge Hexium pour connaitre la derniere version publiee");
+            AddTip(bDl, L"Telecharger : recupere le zip de la derniere version depuis Hexium");
         } else {
             AddTip(bTs, L"Thunderstore : interroge Thunderstore pour connaitre la derniere version publiee");
             AddTip(bDl, L"Telecharger : recupere le zip de la derniere version (demande ou l'enregistrer)");
         }
         AddTip(bEdit,  L"Modifier ce mod");
-        AddTip(bMore,  L"Plus d'actions : copier le lien, localiser le DLL, supprimer...");
+        // Config : ouvre le fichier avec le programme associe par Windows
+        // (Bloc-notes pour un .cfg par defaut, ou tout autre editeur associe
+        // par l'utilisateur) - desactive si aucun fichier de config n'est
+        // renseigne pour ce mod (voir Modifier).
+        if (m.configPath.empty()) {
+            EnableWindow(bConfig, FALSE);
+            AddTip(bConfig, L"Config : aucun fichier associe - a definir dans Modifier");
+        } else {
+            AddTip(bConfig, L"Config : ouvre le fichier de config avec le programme associe par Windows");
+        }
+        AddTip(bMore,  L"Plus d'actions : copier le lien, localiser le DLL/la config, supprimer...");
 
         MkCardStatic(L"", 8, y + CARD_H - 6, 400, 2, g_font, 0, SS_ETCHEDHORZ, true);
         ++row;
@@ -1513,10 +2603,10 @@ static void RefillMods() {
 struct EditCtx {
     Mod m;
     bool ok;
-    HWND hName, hCat, hUrl, hHist, hDesc, hDll, hIcon, hNote, hIconPreview, hNonTs, hModpack, hInstalledVer;
+    HWND hName, hCat, hUrl, hHist, hDesc, hDll, hConfig, hIcon, hNote, hIconPreview, hApiSource, hModpack, hInstalledVer, hTags;
     HICON previewIcon;
-    EditCtx() : ok(false), hName(0), hCat(0), hUrl(0), hHist(0), hDesc(0), hDll(0), hIcon(0),
-                hNote(0), hIconPreview(0), hNonTs(0), hModpack(0), hInstalledVer(0), previewIcon(0) {}
+    EditCtx() : ok(false), hName(0), hCat(0), hUrl(0), hHist(0), hDesc(0), hDll(0), hConfig(0), hIcon(0),
+                hNote(0), hIconPreview(0), hApiSource(0), hModpack(0), hInstalledVer(0), hTags(0), previewIcon(0) {}
 };
 
 static HWND MkLabel(HWND p, const wchar_t* t, int x, int y, int w) {
@@ -1543,7 +2633,8 @@ static HWND MkDlgButton(HWND p, int id, const wchar_t* txt, int x, int y, int w,
 // Boite "Parcourir..." standard ; renvoie 'current' inchange si l'utilisateur
 // annule, pour que l'appelant n'ait pas a distinguer "annule" de "vide".
 static std::wstring BrowseFile(HWND owner, const wchar_t* filter,
-                               const std::wstring& current, const wchar_t* title)
+                               const std::wstring& current, const wchar_t* title,
+                               const std::wstring& fallbackDir = L"")
 {
     wchar_t buf[MAX_PATH]; buf[0] = 0;
     if (!current.empty()) {
@@ -1556,7 +2647,7 @@ static std::wstring BrowseFile(HWND owner, const wchar_t* filter,
         if (p != std::wstring::npos) initDir = current.substr(0, p);
     }
     if (initDir.empty() || !DirExists(initDir)) {
-        std::wstring pd = PluginsDir();
+        std::wstring pd = fallbackDir.empty() ? PluginsDir() : fallbackDir;
         initDir = DirExists(pd) ? pd : L"";
     }
     OPENFILENAMEW ofn; memset(&ofn, 0, sizeof(ofn));
@@ -1622,7 +2713,7 @@ static std::wstring BrowseFolder(HWND owner, const wchar_t* title, const std::ws
 // laisser l'aperçu redevenir silencieusement vide sans explication).
 static bool UpdateIconPreview(EditCtx* c, const std::wstring& path) {
     if (!c || !c->hIconPreview) return false;
-    HICON hi = path.empty() ? NULL : LoadScaledIconFromFile(path, 32);
+    HICON hi = path.empty() ? NULL : LoadScaledIconFromFile(ResolveIconPath(path), 32);
     SendMessageW(c->hIconPreview, STM_SETICON, (WPARAM)hi, 0);
     if (c->previewIcon) DestroyIcon(c->previewIcon);
     c->previewIcon = hi;
@@ -1645,7 +2736,7 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         c->hCat = MkEdit(hwnd, c->m.cat, LX, 76, LW);
         MkLabel(hwnd, L"Lien de la page du mod *", LX, 106, LW);
         c->hUrl = MkEdit(hwnd, c->m.url, LX, 124, LW);
-        MkDlgButton(hwnd, IDC_E_AUTOFILL, L"Auto-remplir depuis Thunderstore", LX, 150, 220, 24);
+        MkDlgButton(hwnd, IDC_E_AUTOFILL, L"Auto-remplir (Thunderstore/Nexus)", LX, 150, 220, 24);
         MkLabel(hwnd, L"Lien historique / changelog (optionnel)", LX, 184, LW);
         c->hHist = MkEdit(hwnd, c->m.changelogUrl, LX, 202, LW);
 
@@ -1667,14 +2758,21 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         MkLabel(hwnd, L"Chemin", IX, 130, 130);
         c->hIcon = MkEdit(hwnd, c->m.iconPath, IX, 148, 130);
 
-        // Masque TS/DL sur la carte et exclut ce mod du "Tout verifier" -
-        // pratique pour un mod Nexus/GitHub que l'URL ne suffit pas a ecarter.
-        c->hNonTs = CreateWindowExW(0, L"BUTTON", L"Non Thunderstore",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-            IX, 182, 130, 40, hwnd, (HMENU)IDC_E_NONTS, g_hInst, NULL);
-        SendMessageW(c->hNonTs, WM_SETFONT, (WPARAM)g_font, TRUE);
-        SendMessageW(c->hNonTs, BM_SETCHECK,
-            c->m.nonThunderstore ? BST_CHECKED : BST_UNCHECKED, 0);
+        // Quelle API utiliser pour la verification/l'auto-remplissage -
+        // remplace l'ancienne case "Non Thunderstore". "Aucune" a le meme
+        // effet qu'avant (masque TS/DL sur la carte, exclut du "Tout
+        // verifier") ; "Nexus" active la verification via l'API Nexus Mods
+        // (necessite une cle API, voir menu Parametres).
+        MkLabel(hwnd, L"Source de verification", IX, 182, 130);
+        c->hApiSource = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+            IX, 200, 130, 200, hwnd, (HMENU)IDC_E_APISOURCE, g_hInst, NULL);
+        SendMessageW(c->hApiSource, WM_SETFONT, (WPARAM)g_font, TRUE);
+        SendMessageW(c->hApiSource, CB_ADDSTRING, 0, (LPARAM)L"Thunderstore");
+        SendMessageW(c->hApiSource, CB_ADDSTRING, 0, (LPARAM)L"Nexus Mods");
+        SendMessageW(c->hApiSource, CB_ADDSTRING, 0, (LPARAM)L"Hexium");
+        SendMessageW(c->hApiSource, CB_ADDSTRING, 0, (LPARAM)L"Aucune (desactive)");
+        SendMessageW(c->hApiSource, CB_SETCURSEL, (WPARAM)c->m.apiSource, 0);
 
         // Regroupe des mods pour un meme playthrough/serveur. CBS_DROPDOWN
         // (pas DROPDOWNLIST) : on peut choisir un modpack existant dans la
@@ -1706,27 +2804,43 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         MkLabel(hwnd, L"Description courte (affichee sur la carte)", LX, 282, LW + 16 + 130);
         c->hDesc = MkEdit(hwnd, c->m.description, LX, 300, LW + 16 + 130);
 
-        // -- DLL associe, pleine largeur -------------------------------------
-        MkLabel(hwnd, L"DLL installe (pour verifier qu'il est bien present)", LX, 332, LW + 16 + 130);
-        c->hDll = MkEdit(hwnd, c->m.dllPath, LX, 350, LW);
+        // -- dossier du mod installe, pleine largeur -------------------------
+        // On demande le DOSSIER dans lequel le mod est installe (typiquement
+        // BepInEx\plugins\NomDuMod\) plutot que le chemin exact d'un .dll :
+        // plus simple a retrouver dans l'explorateur, et resistant aux mods
+        // qui embarquent plusieurs DLL ou renomment le leur d'une version a
+        // l'autre. Le DLL a l'interieur est retrouve automatiquement (voir
+        // ResolveModDll) pour la verification de presence/version.
+        MkLabel(hwnd, L"Dossier du mod installe (pour verifier qu'il est bien present)", LX, 332, LW + 16 + 130);
+        c->hDll = MkEdit(hwnd, c->m.modDir, LX, 350, LW);
         MkDlgButton(hwnd, IDC_E_BROWSEDLL, L"Parcourir...", LX + LW + 24, 350, 124, 24);
+
+        // -- fichier de config associe (optionnel), pleine largeur -----------
+        MkLabel(hwnd, L"Fichier de config (optionnel)", LX, 382, LW + 16 + 130);
+        c->hConfig = MkEdit(hwnd, c->m.configPath, LX, 400, LW);
+        MkDlgButton(hwnd, IDC_E_BROWSECONFIG, L"Parcourir...", LX + LW + 24, 400, 124, 24);
 
         // Version qu'on SUIT comme installee - mise a jour automatiquement
         // par Telecharger/Tout DL (voir ActionDownloadLatest/ActionDownloadAll),
         // ou modifiable ici a la main si l'installation se fait autrement
         // (ou si le zip telecharge n'a pas encore ete extrait).
-        MkLabel(hwnd, L"Version installee (suivie par Telecharger, ou a la main)", LX, 382, 260);
-        c->hInstalledVer = MkEdit(hwnd, c->m.installedVersion, LX, 400, 200);
+        MkLabel(hwnd, L"Version installee (suivie par Telecharger, ou a la main)", LX, 432, 260);
+        c->hInstalledVer = MkEdit(hwnd, c->m.installedVersion, LX, 450, 200);
 
-        MkLabel(hwnd, L"Note (remarques diverses)", LX, 432, LW + 16 + 130);
-        c->hNote = MkEdit(hwnd, c->m.note, LX, 450, LW + 16 + 130);
+        // Tags libres (separes par des virgules) - filtre rapide independant
+        // du modpack (voir menu deroulant "Tag" de la barre du haut).
+        MkLabel(hwnd, L"Tags (separes par des virgules)", LX + 220, 432, LW + 16 + 130 - 220);
+        c->hTags = MkEdit(hwnd, c->m.tags, LX + 220, 450, LW + 16 + 130 - 220);
+
+        MkLabel(hwnd, L"Note (remarques diverses)", LX, 482, LW + 16 + 130);
+        c->hNote = MkEdit(hwnd, c->m.note, LX, 500, LW + 16 + 130);
 
         HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            336, 488, 92, 28, hwnd, (HMENU)IDOK, g_hInst, NULL);
+            336, 538, 92, 28, hwnd, (HMENU)IDOK, g_hInst, NULL);
         HWND ca = CreateWindowExW(0, L"BUTTON", L"Annuler",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            436, 488, 92, 28, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
+            436, 538, 92, 28, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
         SendMessageW(ok, WM_SETFONT, (WPARAM)g_font, TRUE);
         SendMessageW(ca, WM_SETFONT, (WPARAM)g_font, TRUE);
 
@@ -1743,41 +2857,77 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     L"ValMods", MB_OK | MB_ICONINFORMATION);
                 return 0;
             }
-            HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
-            TsAutofillResult r = FetchThunderstoreAutofill(url);
-            SetCursor(oldCursor);
+            // Detecte automatiquement Thunderstore, Nexus ou Hexium d'apres
+            // l'URL - inutile de faire dependre ca de la selection dans le
+            // menu deroulant "Source de verification" (qui, elle, sert
+            // surtout a desactiver completement TS/DL si besoin).
+            bool looksNexus  = url.find(L"nexusmods.com") != std::wstring::npos;
+            bool looksHexium = !looksNexus && url.find(L"hexium.gg") != std::wstring::npos;
 
-            if (!r.isThunderstore) {
+            std::wstring name, category, changelogUrl, description, latestVersion, latestDate, localIconPath;
+            bool matched = false, ok = false; std::wstring error;
+
+            if (looksNexus) {
+                HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
+                NexusAutofillResult r = FetchNexusAutofill(url);
+                SetCursor(oldCursor);
+                matched = r.isNexus; ok = r.ok; error = r.error;
+                name = r.name; description = r.description;
+                latestVersion = r.latestVersion; latestDate = r.latestDate;
+                localIconPath = r.localIconPath;
+            } else if (looksHexium) {
+                HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
+                HexiumAutofillResult r = FetchHexiumAutofill(url);
+                SetCursor(oldCursor);
+                matched = r.isHexium; ok = r.ok; error = r.error;
+                name = r.name; category = r.category; description = r.description;
+                latestVersion = r.latestVersion; latestDate = r.latestDate;
+                localIconPath = r.localIconPath;
+            } else {
+                HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
+                TsAutofillResult r = FetchThunderstoreAutofill(url);
+                SetCursor(oldCursor);
+                matched = r.isThunderstore; ok = r.ok; error = r.error;
+                name = r.name; category = r.category; changelogUrl = r.changelogUrl; description = r.description;
+                latestVersion = r.latestVersion; latestDate = r.latestDate;
+                localIconPath = r.localIconPath;
+                if (matched && ok) SendMessageW(c->hApiSource, CB_SETCURSEL, API_THUNDERSTORE, 0);
+            }
+            if (looksNexus  && matched && ok) SendMessageW(c->hApiSource, CB_SETCURSEL, API_NEXUS, 0);
+            if (looksHexium && matched && ok) SendMessageW(c->hApiSource, CB_SETCURSEL, API_HEXIUM, 0);
+
+            if (!matched) {
                 MessageBoxW(hwnd,
-                    L"Ce lien ne pointe pas vers thunderstore.io :\n"
-                    L"l'auto-remplissage ne fonctionne que pour les mods\n"
-                    L"heberges sur Thunderstore.",
+                    L"Ce lien ne pointe ni vers thunderstore.io, ni vers nexusmods.com,\n"
+                    L"ni vers hexium.gg : l'auto-remplissage ne fonctionne que pour les\n"
+                    L"mods heberges sur l'un de ces sites.",
                     L"ValMods", MB_OK | MB_ICONWARNING);
                 return 0;
             }
-            if (!r.ok) {
-                std::wstring m = L"Auto-remplissage impossible :\n" + r.error;
+            if (!ok) {
+                std::wstring m = L"Auto-remplissage impossible :\n" + error;
                 MessageBoxW(hwnd, m.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
                 return 0;
             }
 
             // remplace toujours les champs concernes : un clic explicite sur
-            // "Auto-remplir" veut dire "je veux les donnees fraiches de Thunderstore".
-            if (!r.name.empty())         SetWindowTextW(c->hName, r.name.c_str());
-            if (!r.category.empty())     SetWindowTextW(c->hCat, r.category.c_str());
-            if (!r.changelogUrl.empty()) SetWindowTextW(c->hHist, r.changelogUrl.c_str());
-            if (!r.description.empty())  SetWindowTextW(c->hDesc, r.description.c_str());
+            // "Auto-remplir" veut dire "je veux les donnees fraiches".
+            if (!name.empty())         SetWindowTextW(c->hName, name.c_str());
+            if (!category.empty())    SetWindowTextW(c->hCat, category.c_str());
+            if (!changelogUrl.empty()) SetWindowTextW(c->hHist, changelogUrl.c_str());
+            if (!description.empty())  SetWindowTextW(c->hDesc, description.c_str());
             bool iconLoadedOk = true;
-            if (!r.localIconPath.empty()) {
-                SetWindowTextW(c->hIcon, r.localIconPath.c_str());
-                iconLoadedOk = UpdateIconPreview(c, r.localIconPath);
+            if (!localIconPath.empty()) {
+                SetWindowTextW(c->hIcon, localIconPath.c_str());
+                iconLoadedOk = UpdateIconPreview(c, localIconPath);
             }
-            c->m.tsVersion = r.latestVersion;   // porte jusqu'a l'enregistrement (pas de champ texte dedie)
-            c->m.tsLatestDate = r.latestDate;
+            c->m.tsVersion = latestVersion;   // porte jusqu'a l'enregistrement (pas de champ texte dedie)
+            c->m.tsLatestDate = latestDate;
 
-            std::wstring summary = L"Champs remplis depuis Thunderstore.\n"
-                L"Derniere version publiee : " + r.latestVersion;
-            if (r.localIconPath.empty())
+            std::wstring sourceLabel = looksNexus ? L"Nexus" : (looksHexium ? L"Hexium" : L"Thunderstore");
+            std::wstring summary = std::wstring(L"Champs remplis depuis ") + sourceLabel +
+                L".\nDerniere version publiee : " + latestVersion;
+            if (localIconPath.empty())
                 summary += L"\n(icone non recuperee - le mod n'en a peut-etre pas)";
             else if (!iconLoadedOk)
                 summary += L"\n(icone telechargee mais illisible - fichier corrompu ou\n"
@@ -1787,10 +2937,21 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (LOWORD(wp) == IDC_E_BROWSEDLL && c) {
+            // On demande le DOSSIER du mod, pas un fichier .dll precis (voir
+            // Mod::modDir) - part du dossier deja renseigne si non vide et
+            // valide, sinon de BepInEx\plugins.
+            std::wstring cur = GetTextOf(c->hDll);
+            std::wstring initial = (!cur.empty() && DirExists(cur)) ? cur : PluginsDir();
+            std::wstring picked = BrowseFolder(hwnd, L"Choisir le dossier du mod installe", initial);
+            if (!picked.empty()) SetWindowTextW(c->hDll, picked.c_str());
+            return 0;
+        }
+        if (LOWORD(wp) == IDC_E_BROWSECONFIG && c) {
             std::wstring picked = BrowseFile(hwnd,
-                L"Bibliotheques (*.dll)\0*.dll\0Tous les fichiers (*.*)\0*.*\0",
-                GetTextOf(c->hDll), L"Choisir le DLL installe");
-            SetWindowTextW(c->hDll, picked.c_str());
+                L"Config (*.cfg;*.json;*.yaml;*.yml;*.txt)\0*.cfg;*.json;*.yaml;*.yml;*.txt\0"
+                L"Tous les fichiers (*.*)\0*.*\0",
+                GetTextOf(c->hConfig), L"Choisir le fichier de config du mod", ConfigDir());
+            SetWindowTextW(c->hConfig, picked.c_str());
             return 0;
         }
         if (LOWORD(wp) == IDC_E_BROWSEICON && c) {
@@ -1798,8 +2959,20 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 L"Images (*.png;*.jpg;*.jpeg;*.bmp;*.ico;*.gif)\0*.png;*.jpg;*.jpeg;*.bmp;*.ico;*.gif\0"
                 L"Tous les fichiers (*.*)\0*.*\0",
                 GetTextOf(c->hIcon), L"Choisir une icone");
-            SetWindowTextW(c->hIcon, picked.c_str());
-            if (!picked.empty() && !UpdateIconPreview(c, picked)) {
+            std::wstring stored = picked;
+            if (!picked.empty()) {
+                // Copie le fichier choisi dans icons\ a cote de l'exe (sauf
+                // s'il s'y trouve deja) pour pouvoir stocker un chemin
+                // RELATIF (voir StoreIconPath) - indispensable pour que
+                // valmods.json + valmods.exe + icons\ restent portables si on
+                // les envoie a un ami. En cas d'echec de la copie (disque
+                // plein, permissions...), on garde simplement le chemin
+                // choisi tel quel (fonctionnera toujours en local).
+                std::wstring copied = CopyIconIntoIconsDir(ResolveIconPath(picked));
+                stored = copied.empty() ? picked : StoreIconPath(copied);
+            }
+            SetWindowTextW(c->hIcon, stored.c_str());
+            if (!stored.empty() && !UpdateIconPreview(c, stored)) {
                 MessageBoxW(hwnd,
                     L"Ce fichier n'a pas pu etre charge comme icone.\n\n"
                     L"Causes possibles :\n"
@@ -1830,11 +3003,19 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             c->m.url  = u;
             c->m.changelogUrl = Clean(GetTextOf(c->hHist));
             c->m.description  = Clean(GetTextOf(c->hDesc));
-            c->m.dllPath      = Clean(GetTextOf(c->hDll));
+            c->m.modDir       = Clean(GetTextOf(c->hDll));
+            c->m.configPath   = Clean(GetTextOf(c->hConfig));
             c->m.installedVersion = Clean(GetTextOf(c->hInstalledVer));
-            c->m.iconPath     = Clean(GetTextOf(c->hIcon));
+            c->m.tags = Clean(GetTextOf(c->hTags));
+            // StoreIconPath en filet de securite : si le champ a ete tape a
+            // la main avec un chemin absolu qui se trouve deja sous le
+            // dossier de l'exe, on le relativise quand meme.
+            c->m.iconPath     = StoreIconPath(Clean(GetTextOf(c->hIcon)));
             c->m.note = Clean(GetTextOf(c->hNote));
-            c->m.nonThunderstore = (SendMessageW(c->hNonTs, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            {
+                int sel = (int)SendMessageW(c->hApiSource, CB_GETCURSEL, 0, 0);
+                c->m.apiSource = (sel < 0) ? API_THUNDERSTORE : sel;
+            }
             c->m.modpack = Clean(GetTextOf(c->hModpack));
             c->ok = true;
             DestroyWindow(hwnd);
@@ -1868,7 +3049,7 @@ static bool ShowModEditor(HWND parent, const wchar_t* title, Mod& io) {
         reg = true;
     }
     EditCtx ctx; ctx.m = io;
-    RECT r = { 0, 0, 540, 530 };
+    RECT r = { 0, 0, 540, 580 };
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     AdjustWindowRect(&r, style, FALSE);
     RECT pr; GetWindowRect(parent, &pr);
@@ -1894,6 +3075,112 @@ static bool ShowModEditor(HWND parent, const wchar_t* title, Mod& io) {
     SetForegroundWindow(parent);
     if (ctx.ok) io = ctx.m;
     return ctx.ok;
+}
+
+// ---------------------------------------------------------------- saisie generique
+// Petite boite modale generique "un champ texte + OK/Annuler" - utilisee pour
+// la cle API Nexus (menu Parametres), sur le meme principe que ShowModEditor
+// mais bien plus simple (un seul controle).
+struct TextInputCtx {
+    std::wstring prompt, value;
+    bool ok;
+    HWND hEdit;
+    TextInputCtx() : ok(false), hEdit(0) {}
+};
+static LRESULT CALLBACK TextInputProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    TextInputCtx* c = (TextInputCtx*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_CREATE: {
+        CREATESTRUCTW* cs = (CREATESTRUCTW*)lp;
+        c = (TextInputCtx*)cs->lpCreateParams;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)c);
+        MkLabel(hwnd, c->prompt.c_str(), 12, 12, 380);
+        c->hEdit = MkEdit(hwnd, c->value, 12, 34, 380);
+        HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            216, 68, 84, 26, hwnd, (HMENU)IDOK, g_hInst, NULL);
+        HWND ca = CreateWindowExW(0, L"BUTTON", L"Annuler",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            308, 68, 84, 26, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
+        SendMessageW(ok, WM_SETFONT, (WPARAM)g_font, TRUE);
+        SendMessageW(ca, WM_SETFONT, (WPARAM)g_font, TRUE);
+        SetFocus(c->hEdit);
+        SendMessageW(c->hEdit, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK && c) {
+            c->value = GetTextOf(c->hEdit);
+            c->ok = true;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (LOWORD(wp) == IDCANCEL) { DestroyWindow(hwnd); return 0; }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+// Renvoie true si l'utilisateur a valide (io est alors mis a jour) ; false
+// si annule (io reste inchange). Le texte n'est PAS force en majuscules/
+// nettoye (Clean()) par l'appelant, contrairement aux autres champs de
+// l'appli - une cle API peut contenir des caracteres que Clean() laisse de
+// toute facon intacts (ni tabulation ni retour a la ligne attendus ici).
+static bool ShowTextInputDialog(HWND parent, const wchar_t* title, const wchar_t* prompt, std::wstring& io) {
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXW wc; memset(&wc, 0, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = TextInputProc;
+        wc.hInstance = g_hInst;
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"ValModsTextInput";
+        RegisterClassExW(&wc);
+        reg = true;
+    }
+    TextInputCtx ctx; ctx.prompt = prompt; ctx.value = io;
+    RECT r = { 0, 0, 410, 110 };
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    AdjustWindowRect(&r, style, FALSE);
+    RECT pr; GetWindowRect(parent, &pr);
+    int w = r.right - r.left, h = r.bottom - r.top;
+    int x = pr.left + ((pr.right - pr.left) - w) / 2;
+    int y = pr.top + ((pr.bottom - pr.top) - h) / 2;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+        L"ValModsTextInput", title, style, x, y, w, h, parent, NULL, g_hInst, &ctx);
+    if (!dlg) return false;
+    EnableWindow(parent, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    UpdateWindow(dlg);
+
+    MSG msg;
+    while (IsWindow(dlg) && GetMessageW(&msg, NULL, 0, 0)) {
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(parent, TRUE);
+    SetForegroundWindow(parent);
+    if (ctx.ok) io = ctx.value;
+    return ctx.ok;
+}
+// Ouvre la boite de saisie de la cle API Nexus (menu Parametres) et
+// enregistre immediatement si validee.
+static void ChooseNexusApiKey(HWND hwnd) {
+    std::wstring key = g_nexusApiKey;
+    if (!ShowTextInputDialog(hwnd, L"Cle API Nexus Mods",
+            L"Cle API personnelle (Compte Nexus > Parametres > API Keys) :", key))
+        return;   // annule
+    g_nexusApiKey = Clean(key);
+    SaveIni();
+    Info(hwnd, g_nexusApiKey.empty()
+        ? L"Cle API Nexus effacee - la verification Nexus sera desactivee."
+        : L"Cle API Nexus enregistree.");
 }
 
 // ---------------------------------------------------------------- sauvegardes
@@ -2022,7 +3309,7 @@ static void ActionAdd(HWND hwnd) {
         g_mods.push_back(m);
         SaveMods();
         RefillMods();
-        ScrollToMod(m.name);
+        ScrollToMod(m.uid);
     }
 }
 static void ActionEdit(HWND hwnd, int idx) {
@@ -2032,7 +3319,7 @@ static void ActionEdit(HWND hwnd, int idx) {
         g_mods[idx] = m;
         SaveMods();
         RefillMods();
-        ScrollToMod(m.name);
+        ScrollToMod(m.uid);
     }
 }
 static void ActionDelete(HWND hwnd, int idx) {
@@ -2059,28 +3346,63 @@ static void ActionOpenHistory(HWND hwnd, int idx) {
 }
 static void ActionLocateDll(HWND hwnd, int idx) {
     if (!ValidMod(hwnd, idx)) return;
-    const std::wstring& p = g_mods[idx].dllPath;
+    const Mod& m = g_mods[idx];
+    if (m.modDir.empty()) {
+        Info(hwnd, L"Aucun dossier de mod associe a ce mod.\nAssocie-le en modifiant le mod (bouton Modif.).");
+        return;
+    }
+    if (!DirExists(m.modDir)) {
+        std::wstring msg = L"Le dossier du mod associe est introuvable :\n" + m.modDir;
+        MessageBoxW(hwnd, msg.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    std::wstring dll = ResolveModDll(m);
+    if (dll.empty()) {
+        std::wstring msg = L"Aucun DLL trouve dans ce dossier :\n" + m.modDir;
+        MessageBoxW(hwnd, msg.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    RevealFile(dll);
+}
+static void ActionOpenDllDir(HWND hwnd, int idx) {
+    if (!ValidMod(hwnd, idx)) return;
+    const std::wstring& dir = g_mods[idx].modDir;
+    if (dir.empty()) {
+        Info(hwnd, L"Aucun dossier de mod associe a ce mod.\nAssocie-le en modifiant le mod (bouton Modif.).");
+        return;
+    }
+    OpenFolder(hwnd, dir, L"dossier du mod");
+}
+static void ActionLocateConfig(HWND hwnd, int idx) {
+    if (!ValidMod(hwnd, idx)) return;
+    const std::wstring& p = g_mods[idx].configPath;
     if (p.empty()) {
-        Info(hwnd, L"Aucun DLL associe a ce mod.\nAssocie-le en modifiant le mod (bouton Modif.).");
+        Info(hwnd, L"Aucun fichier de config associe a ce mod.\nAssocie-le en modifiant le mod (bouton Modif.).");
         return;
     }
     if (!FileExists(p)) {
-        std::wstring m = L"Le fichier DLL associe est introuvable :\n" + p;
-        MessageBoxW(hwnd, m.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
+        std::wstring msg = L"Le fichier de config associe est introuvable :\n" + p;
+        MessageBoxW(hwnd, msg.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
         return;
     }
     RevealFile(p);
 }
-static void ActionOpenDllDir(HWND hwnd, int idx) {
+static void ActionOpenConfig(HWND hwnd, int idx) {
     if (!ValidMod(hwnd, idx)) return;
-    const std::wstring& p = g_mods[idx].dllPath;
+    const std::wstring& p = g_mods[idx].configPath;
     if (p.empty()) {
-        Info(hwnd, L"Aucun DLL associe a ce mod.\nAssocie-le en modifiant le mod (bouton Modif.).");
+        Info(hwnd, L"Aucun fichier de config associe a ce mod.\nAssocie-le en modifiant le mod (bouton Modif.).");
         return;
     }
-    size_t s = p.find_last_of(L"\\/");
-    std::wstring dir = (s == std::wstring::npos) ? PluginsDir() : p.substr(0, s);
-    OpenFolder(hwnd, dir, L"dossier du DLL");
+    if (!FileExists(p)) {
+        std::wstring msg = L"Le fichier de config associe est introuvable :\n" + p;
+        MessageBoxW(hwnd, msg.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    // ouvre avec l'application associee (Notepad par defaut pour .cfg sous
+    // Windows, ou tout autre editeur que l'utilisateur a associe) plutot
+    // que de forcer un programme en particulier.
+    ShellExecuteW(NULL, L"open", p.c_str(), NULL, NULL, SW_SHOWNORMAL);
 }
 static void ShowRowOverflowMenu(HWND hwnd, int idx) {
     if (!ValidMod(hwnd, idx)) return;
@@ -2089,49 +3411,86 @@ static void ShowRowOverflowMenu(HWND hwnd, int idx) {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, IDM_CTX_COPY,        L"Copier le lien");
     AppendMenuW(m, MF_STRING, IDM_CTX_LOCATE_DLL,  L"Localiser le DLL dans l'explorateur");
-    AppendMenuW(m, MF_STRING, IDM_CTX_OPEN_DLLDIR, L"Ouvrir le dossier du DLL");
+    AppendMenuW(m, MF_STRING, IDM_CTX_OPEN_DLLDIR, L"Ouvrir le dossier du mod");
+    AppendMenuW(m, MF_STRING, IDM_CTX_LOCATE_CONFIG, L"Localiser le fichier de config");
+    AppendMenuW(m, MF_STRING, IDM_CTX_OPEN_CONFIG,   L"Ouvrir le fichier de config");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_CTX_DELETE,      L"Supprimer");
     TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
     DestroyMenu(m);
 }
+// Verifie la derniere version publiee (bouton eclair sur une carte),
+// via Thunderstore ou Nexus selon la source configuree pour ce mod (voir
+// Mod::apiSource / menu deroulant "Source de verification" de l'editeur).
 static void ActionCheckThunderstore(HWND hwnd, int idx) {
     if (!ValidMod(hwnd, idx)) return;
-    if (g_mods[idx].nonThunderstore) {
-        Info(hwnd, L"Ce mod est marque \"Non Thunderstore\" (voir Modifier) - "
-                   L"la verification est desactivee pour lui.");
+    if (g_mods[idx].apiSource == API_NONE) {
+        Info(hwnd, L"La verification est desactivee pour ce mod (source \"Aucune\", voir Modifier).");
         return;
     }
-    std::wstring name = g_mods[idx].name;
     std::wstring url = g_mods[idx].url;
+    int uid = g_mods[idx].uid;
+    bool useNexus  = (g_mods[idx].apiSource == API_NEXUS);
+    bool useHexium = (g_mods[idx].apiSource == API_HEXIUM);
+
+    std::wstring latestVersion, latestDate, description, error;
+    bool matched = false, ok = false, deprecated = false;
 
     HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
-    TsCheckResult r = CheckThunderstoreVersion(url);
+    if (useNexus) {
+        NexusCheckResult r = CheckNexusVersion(url);
+        matched = r.isNexus; ok = r.ok; error = r.error;
+        latestVersion = r.latestVersion; latestDate = r.latestDate; description = r.description;
+        deprecated = r.unavailable;
+    } else if (useHexium) {
+        HexiumCheckResult r = CheckHexiumVersion(url);
+        matched = r.isHexium; ok = r.ok; error = r.error;
+        latestVersion = r.latestVersion; latestDate = r.latestDate; description = r.description;
+        deprecated = r.deprecated;
+    } else {
+        TsCheckResult r = CheckThunderstoreVersion(url);
+        matched = r.isThunderstore; ok = r.ok; error = r.error;
+        latestVersion = r.latestVersion; latestDate = r.latestDate; description = r.description;
+        deprecated = r.deprecated;
+    }
     SetCursor(oldCursor);
 
-    if (!r.isThunderstore) {
-        Info(hwnd, L"Le lien de ce mod ne pointe pas vers thunderstore.io.\n"
-                   L"La verification automatique ne fonctionne que pour les mods\n"
-                   L"heberges sur Thunderstore (Nexus, GitHub... ne sont pas geres).");
+    if (!matched) {
+        std::wstring m = useNexus
+            ? L"Le lien de ce mod ne pointe pas vers nexusmods.com.\n"
+              L"La verification Nexus ne fonctionne que pour un lien "
+              L"nexusmods.com/valheim/mods/<id>."
+            : useHexium
+            ? L"Le lien de ce mod ne pointe pas vers hexium.gg.\n"
+              L"La verification Hexium ne fonctionne que pour un lien "
+              L"valheim.hexium.gg/mods/<equipe>/<nom>."
+            : L"Le lien de ce mod ne pointe pas vers thunderstore.io.\n"
+              L"La verification automatique ne fonctionne que pour les mods\n"
+              L"heberges sur Thunderstore (change la source en \"Nexus\"/\"Hexium\" "
+              L"dans Modifier si ce mod vient de l'un de ces sites).";
+        Info(hwnd, m.c_str());
         return;
     }
-    if (!r.ok) {
-        std::wstring m = L"Verification impossible :\n" + r.error;
+    if (!ok) {
+        std::wstring m = L"Verification impossible :\n" + error;
         MessageBoxW(hwnd, m.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
         return;
     }
 
     // la liste peut avoir ete retriee pendant l'appel reseau : on retrouve
-    // le mod par son nom plutot que de garder l'index d'avant l'appel.
+    // le mod par son identifiant stable (voir Mod::uid), PAS par son nom -
+    // deux mods peuvent partager le meme nom (le meme mod ajoute a deux
+    // modpacks comme deux fiches separees), et chercher par nom mettrait a
+    // jour la mauvaise fiche dans ce cas.
     for (size_t k = 0; k < g_mods.size(); ++k) {
-        if (g_mods[k].name == name) {
-            g_mods[k].tsVersion = r.latestVersion;
-            g_mods[k].tsLatestDate = r.latestDate;
+        if (g_mods[k].uid == uid) {
+            g_mods[k].tsVersion = latestVersion;
+            g_mods[k].tsLatestDate = latestDate;
             // bonus non-destructif : on ne remplit la description que si
             // elle est vide, contrairement a Auto-remplir qui l'ecrase
             // toujours (ici ce n'est pas l'action demandee explicitement).
-            if (g_mods[k].description.empty() && !r.description.empty())
-                g_mods[k].description = r.description;
+            if (g_mods[k].description.empty() && !description.empty())
+                g_mods[k].description = description;
             g_mods[k].last = NowStamp();   // une verification en ligne compte comme une verification
             SaveMods();
             RefillMods();
@@ -2139,34 +3498,48 @@ static void ActionCheckThunderstore(HWND hwnd, int idx) {
         }
     }
 
-    std::wstring msg = L"Derniere version publiee sur Thunderstore : " + r.latestVersion;
-    if (r.deprecated)
-        msg += L"\n\nATTENTION : ce mod est marque comme deprecie (abandonne) "
-              L"par son auteur sur Thunderstore.";
+    std::wstring sourceLabel = useNexus ? L"Nexus" : (useHexium ? L"Hexium" : L"Thunderstore");
+    std::wstring msg = std::wstring(L"Derniere version publiee sur ") + sourceLabel +
+        L" : " + latestVersion;
+    if (deprecated)
+        msg += useNexus
+            ? L"\n\nATTENTION : ce mod semble retire/masque sur Nexus."
+            : L"\n\nATTENTION : ce mod est marque comme deprecie (abandonne) "
+              L"par son auteur sur " + sourceLabel + L".";
     Info(hwnd, msg.c_str());
 }
-// Verifie tous les mods eligibles (lien Thunderstore, non marques "Non
-// Thunderstore") en une seule fois. Synchrone et sequentiel comme le reste
-// des appels reseau de l'appli - potentiellement long pour une longue
-// liste, d'ou la confirmation prealable qui indique combien de mods sont
-// concernes avant de se lancer.
+// Un mod est eligible a "Tout verifier" si sa source n'est pas desactivee
+// et que son lien correspond bien au site attendu par cette source.
+static bool ModEligibleForBulkCheck(const Mod& m) {
+    if (m.apiSource == API_NONE) return false;
+    std::wstring a, b;
+    if (m.apiSource == API_NEXUS)  return ParseNexusUrl(m.url, a);
+    if (m.apiSource == API_HEXIUM) return ParseHexiumUrl(m.url, a, b);
+    return ParseThunderstoreUrl(m.url, a, b);
+}
+// Verifie tous les mods eligibles (Thunderstore ou Nexus selon leur source,
+// voir ModEligibleForBulkCheck) en une seule fois. Synchrone et sequentiel
+// comme le reste des appels reseau de l'appli - potentiellement long pour
+// une longue liste, d'ou la confirmation prealable qui indique combien de
+// mods sont concernes avant de se lancer.
 static void ActionCheckAll(HWND hwnd) {
     if (g_mods.empty()) { Info(hwnd, L"Aucun mod dans la liste."); return; }
 
     int eligible = 0;
     for (size_t i = 0; i < g_mods.size(); ++i) {
-        if (g_mods[i].nonThunderstore || !ModMatchesPack(g_mods[i])) continue;
-        std::wstring ns, nm;
-        if (ParseThunderstoreUrl(g_mods[i].url, ns, nm)) ++eligible;
+        if (!ModMatchesFilters(g_mods[i])) continue;
+        if (ModEligibleForBulkCheck(g_mods[i])) ++eligible;
     }
     if (eligible == 0) {
         Info(hwnd, L"Aucun mod eligible : il faut un lien vers thunderstore.io,\n"
-                   L"ne pas etre marque \"Non Thunderstore\" (voir Modifier), et\n"
-                   L"correspondre au filtre modpack actuel s'il y en a un.");
+                   L"nexusmods.com ou hexium.gg correspondant a la source choisie\n"
+                   L"(voir Modifier), ne pas etre marque \"Aucune\", et correspondre\n"
+                   L"aux filtres modpack/tag actuels s'il y en a.");
         return;
     }
     std::wstring packLabel = g_modpackFilter.empty() ? L"tous les mods" : (L"modpack \"" + g_modpackFilter + L"\"");
-    std::wstring q = L"Verifier les " + std::to_wstring(eligible) + L" mod(s) Thunderstore de la liste (" +
+    if (!g_tagFilter.empty()) packLabel += L", tag \"" + g_tagFilter + L"\"";
+    std::wstring q = L"Verifier les " + std::to_wstring(eligible) + L" mod(s) eligibles de la liste (" +
         packLabel + L") ?\n\n"
         L"Derniere verification globale : " +
         (g_lastGlobalCheck.empty() ? L"jamais" : g_lastGlobalCheck) + L"\n\n"
@@ -2177,37 +3550,46 @@ static void ActionCheckAll(HWND hwnd) {
         L"l'autre (pas en parallele).";
     if (MessageBoxW(hwnd, q.c_str(), L"ValMods", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
 
-    // Comme les autres actions, on retrouve chaque mod par son nom plutot
-    // que par index, au cas ou la liste serait retriee en cours de route
-    // (ici ca n'arrive pas puisque rien d'autre ne tourne pendant la
-    // boucle, mais ca reste la facon coherente de faire dans ce fichier).
-    std::vector<std::wstring> names;
-    for (size_t i = 0; i < g_mods.size(); ++i) names.push_back(g_mods[i].name);
+    // On retrouve chaque mod par son identifiant stable (voir Mod::uid),
+    // PAS par son nom : deux mods peuvent partager le meme nom (le meme mod
+    // ajoute a deux modpacks differents comme deux fiches separees), et
+    // chercher par nom ferait retomber les DEUX occurrences sur la premiere
+    // trouvee - un des deux mods serait alors traite deux fois (une fois
+    // pour rien) pendant que l'autre ne serait jamais verifie du tout.
+    std::vector<int> uids;
+    for (size_t i = 0; i < g_mods.size(); ++i) uids.push_back(g_mods[i].uid);
 
     HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
     int outdated = 0, upToDate = 0, errors = 0, skipped = 0;
-    for (size_t i = 0; i < names.size(); ++i) {
+    for (size_t i = 0; i < uids.size(); ++i) {
         int idx = -1;
         for (size_t k = 0; k < g_mods.size(); ++k)
-            if (g_mods[k].name == names[i]) { idx = (int)k; break; }
+            if (g_mods[k].uid == uids[i]) { idx = (int)k; break; }
         if (idx < 0) continue;
-        if (g_mods[idx].nonThunderstore || !ModMatchesPack(g_mods[idx])) { ++skipped; continue; }
+        if (!ModMatchesFilters(g_mods[idx]) || !ModEligibleForBulkCheck(g_mods[idx])) { ++skipped; continue; }
 
         std::wstring url = g_mods[idx].url;
-        std::wstring ns, nm;
-        if (!ParseThunderstoreUrl(url, ns, nm)) { ++skipped; continue; }
-
-        TsCheckResult r = CheckThunderstoreVersion(url);
-        if (!r.ok) { ++errors; continue; }
+        std::wstring latestVersion, latestDate, description; bool ok = false;
+        if (g_mods[idx].apiSource == API_NEXUS) {
+            NexusCheckResult r = CheckNexusVersion(url);
+            ok = r.ok; latestVersion = r.latestVersion; latestDate = r.latestDate; description = r.description;
+        } else if (g_mods[idx].apiSource == API_HEXIUM) {
+            HexiumCheckResult r = CheckHexiumVersion(url);
+            ok = r.ok; latestVersion = r.latestVersion; latestDate = r.latestDate; description = r.description;
+        } else {
+            TsCheckResult r = CheckThunderstoreVersion(url);
+            ok = r.ok; latestVersion = r.latestVersion; latestDate = r.latestDate; description = r.description;
+        }
+        if (!ok) { ++errors; continue; }
 
         bool isOutdated = false;
         std::wstring installed = GetEffectiveInstalledVersion(g_mods[idx]);
-        if (!installed.empty() && VersionLess(installed, r.latestVersion)) isOutdated = true;
+        if (!installed.empty() && VersionLess(installed, latestVersion)) isOutdated = true;
 
-        g_mods[idx].tsVersion = r.latestVersion;
-        g_mods[idx].tsLatestDate = r.latestDate;
-        if (g_mods[idx].description.empty() && !r.description.empty())
-            g_mods[idx].description = r.description;
+        g_mods[idx].tsVersion = latestVersion;
+        g_mods[idx].tsLatestDate = latestDate;
+        if (g_mods[idx].description.empty() && !description.empty())
+            g_mods[idx].description = description;
         // PAS de g_mods[idx].last ici : "Tout verifier" est une operation
         // groupee/automatisee, distincte d'une verification personnelle -
         // seule g_lastGlobalCheck (globale, separee) est mise a jour plus
@@ -2227,18 +3609,199 @@ static void ActionCheckAll(HWND hwnd) {
         std::to_wstring(outdated) + L" mise(s) a jour disponible(s)\n" +
         std::to_wstring(upToDate) + L" a jour\n" +
         std::to_wstring(errors)  + L" erreur(s)\n" +
-        std::to_wstring(skipped) + L" ignore(s) (non Thunderstore / hors modpack)";
+        std::to_wstring(skipped) + L" ignore(s) (source \"Aucune\" / lien non reconnu / hors modpack ou tag)";
+    Info(hwnd, summary.c_str());
+}
+// Un mod a des informations "completables" s'il lui manque au moins un des
+// champs que l'auto-remplissage peut fournir. Nexus n'expose pas de
+// categorie/lien historique (voir FetchNexusAutofill) : on ne considere que
+// description/icone pour lui, sinon un mod Nexus resterait indefiniment
+// "incomplet" pour des champs qu'aucune source ne peut jamais renseigner.
+static bool ModMissingAutofillableField(const Mod& m) {
+    if (m.apiSource == API_NEXUS) return m.description.empty() || m.iconPath.empty();
+    // Hexium fournit une categorie (owner) mais pas de lien de changelog
+    // separe (voir FetchHexiumAutofill) - meme logique que Nexus pour ce
+    // champ, mais categorie tout de meme prise en compte comme Thunderstore.
+    if (m.apiSource == API_HEXIUM) return m.category.empty() || m.description.empty() || m.iconPath.empty();
+    return m.category.empty() || m.changelogUrl.empty() || m.description.empty() || m.iconPath.empty();
+}
+// "Completer la liste" (menu Outils) : repasse l'auto-remplissage sur tous
+// les mods eligibles, mais de facon NON DESTRUCTIVE - contrairement au
+// bouton Auto-remplir de l'editeur qui ecrase toujours les champs, ici on
+// ne touche QUE ce qui est actuellement vide (categorie / lien historique /
+// description / icone), pour ne jamais effacer une valeur deja saisie ou
+// corrigee a la main. tsVersion/tsLatestDate sont rafraichis a chaque fois
+// (bonus sans risque, deja recuperes par le meme appel reseau) ; en
+// revanche installedVersion n'est JAMAIS touche - ce champ est reserve a
+// Telecharger/Tout DL ou a une saisie manuelle (voir GetEffectiveInstalledVersion).
+static void ActionFixList(HWND hwnd) {
+    if (g_mods.empty()) { Info(hwnd, L"Aucun mod dans la liste."); return; }
+
+    int candidates = 0;
+    for (size_t i = 0; i < g_mods.size(); ++i) {
+        if (!ModMatchesFilters(g_mods[i])) continue;
+        if (ModEligibleForBulkCheck(g_mods[i]) && ModMissingAutofillableField(g_mods[i])) ++candidates;
+    }
+    if (candidates == 0) {
+        Info(hwnd, L"Rien a completer parmi les mods eligibles (lien Thunderstore/\n"
+                   L"Nexus valide, source non \"Aucune\", et correspondant aux filtres\n"
+                   L"modpack/tag actuels s'il y en a) : categorie, lien historique,\n"
+                   L"description et icone sont deja renseignes partout.");
+        return;
+    }
+    std::wstring packLabel = g_modpackFilter.empty() ? L"tous les mods" : (L"modpack \"" + g_modpackFilter + L"\"");
+    if (!g_tagFilter.empty()) packLabel += L", tag \"" + g_tagFilter + L"\"";
+    std::wstring q = L"Completer les informations manquantes de " + std::to_wstring(candidates) +
+        L" mod(s) de la liste (" + packLabel + L") ?\n\n"
+        L"Remplit UNIQUEMENT les champs actuellement VIDES (categorie, lien\n"
+        L"historique, description, icone) - une valeur deja saisie ou\n"
+        L"corrigee a la main n'est jamais ecrasee. La derniere version\n"
+        L"connue (tsVersion) est aussi rafraichie au passage.\n\n"
+        L"Ne touche JAMAIS la version installee (installedVersion).\n\n"
+        L"Ca peut prendre du temps : un appel reseau par mod concerne, l'un\n"
+        L"apres l'autre (pas en parallele).";
+    if (MessageBoxW(hwnd, q.c_str(), L"ValMods", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+
+    // Identifiants stables (voir Mod::uid) plutot que des index directs : un
+    // appel reseau peut prendre du temps, mieux vaut ne jamais supposer que
+    // g_mods n'a pas bouge entre-temps (voir ActionCheckAll, meme logique).
+    std::vector<int> uids;
+    for (size_t i = 0; i < g_mods.size(); ++i) uids.push_back(g_mods[i].uid);
+
+    HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
+    int filled = 0, alreadyOk = 0, errors = 0, skipped = 0;
+    for (size_t i = 0; i < uids.size(); ++i) {
+        int idx = -1;
+        for (size_t k = 0; k < g_mods.size(); ++k)
+            if (g_mods[k].uid == uids[i]) { idx = (int)k; break; }
+        if (idx < 0) continue;
+        if (!ModMatchesFilters(g_mods[idx]) || !ModEligibleForBulkCheck(g_mods[idx]) ||
+            !ModMissingAutofillableField(g_mods[idx])) { ++skipped; continue; }
+
+        Mod& m = g_mods[idx];
+        std::wstring category, changelogUrl, description, iconPath, tsVersion, tsLatestDate;
+        bool ok = false;
+        if (m.apiSource == API_NEXUS) {
+            NexusAutofillResult r = FetchNexusAutofill(m.url);
+            ok = r.ok;
+            description = r.description; iconPath = r.localIconPath;
+            tsVersion = r.latestVersion; tsLatestDate = r.latestDate;
+        } else if (m.apiSource == API_HEXIUM) {
+            HexiumAutofillResult r = FetchHexiumAutofill(m.url);
+            ok = r.ok;
+            category = r.category; description = r.description; iconPath = r.localIconPath;
+            tsVersion = r.latestVersion; tsLatestDate = r.latestDate;
+        } else {
+            TsAutofillResult r = FetchThunderstoreAutofill(m.url);
+            ok = r.ok;
+            category = r.category; changelogUrl = r.changelogUrl; description = r.description;
+            iconPath = r.localIconPath;
+            tsVersion = r.latestVersion; tsLatestDate = r.latestDate;
+        }
+        if (!ok) { ++errors; continue; }
+
+        bool changed = false;
+        if (m.category.empty() && !category.empty())         { m.category = category;         changed = true; }
+        if (m.changelogUrl.empty() && !changelogUrl.empty()) { m.changelogUrl = changelogUrl;   changed = true; }
+        if (m.description.empty() && !description.empty())   { m.description = description;    changed = true; }
+        if (m.iconPath.empty() && !iconPath.empty())          { m.iconPath = iconPath;           changed = true; }
+        if (!tsVersion.empty())    m.tsVersion = tsVersion;       // bonus non-destructif : toujours a jour
+        if (!tsLatestDate.empty()) m.tsLatestDate = tsLatestDate;
+
+        if (changed) ++filled; else ++alreadyOk;
+        // PAS de m.last ni de g_lastGlobalCheck ici : completer des champs
+        // descriptifs n'est ni une verification personnelle, ni "Tout
+        // verifier" - les deux dates gardent leur sens propre (voir plus haut).
+    }
+    SetCursor(oldCursor);
+
+    SaveMods();
+    RefillMods();
+
+    std::wstring summary = L"Completion terminee.\n\n" +
+        std::to_wstring(filled)    + L" mod(s) complete(s)\n" +
+        std::to_wstring(alreadyOk) + L" deja a jour (rien de nouveau trouve)\n" +
+        std::to_wstring(errors)    + L" erreur(s)\n" +
+        std::to_wstring(skipped)   + L" ignore(s) (source \"Aucune\" / lien non reconnu / "
+                                      L"deja complets / hors modpack ou tag)";
     Info(hwnd, summary.c_str());
 }
 static void ActionDownloadLatest(HWND hwnd, int idx) {
     if (!ValidMod(hwnd, idx)) return;
-    if (g_mods[idx].nonThunderstore) {
-        Info(hwnd, L"Ce mod est marque \"Non Thunderstore\" (voir Modifier) - "
-                   L"le telechargement est desactive pour lui.");
+    if (g_mods[idx].apiSource == API_NEXUS) {
+        Info(hwnd, L"Le telechargement direct n'est pas disponible pour Nexus\n"
+                   L"(l'API de telechargement de Nexus est reservee aux comptes\n"
+                   L"Premium) - utilise le bouton Watch pour aller chercher le\n"
+                   L"fichier a la main sur la page du mod.");
         return;
     }
-    std::wstring name = g_mods[idx].name;
+    if (g_mods[idx].apiSource == API_NONE) {
+        Info(hwnd, L"Le telechargement est desactive pour ce mod (source \"Aucune\", voir Modifier).");
+        return;
+    }
+    bool useHexium = (g_mods[idx].apiSource == API_HEXIUM);
     std::wstring url = g_mods[idx].url;
+    int uid = g_mods[idx].uid;
+
+    if (useHexium) {
+        // Contrairement a Thunderstore, il n'existe pas de pattern d'URL de
+        // telechargement a reconstruire a la main : on interroge Hexium
+        // pour recuperer le download_url de la derniere version, meme si
+        // tsVersion est deja connu (voir CheckHexiumVersion/DownloadHexiumZip).
+        std::wstring team, pkgName;
+        if (!ParseHexiumUrl(url, team, pkgName)) {
+            Info(hwnd, L"Le lien de ce mod ne pointe pas vers hexium.gg :\n"
+                       L"le telechargement direct ne fonctionne que pour les mods\n"
+                       L"heberges sur Hexium.");
+            return;
+        }
+        HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
+        HexiumCheckResult chk = CheckHexiumVersion(url);
+        SetCursor(oldCursor);
+        if (!chk.ok || chk.downloadUrl.empty()) {
+            std::wstring m = L"Impossible de determiner la derniere version :\n" +
+                (chk.ok ? std::wstring(L"lien de telechargement manquant dans la reponse Hexium.") : chk.error);
+            MessageBoxW(hwnd, m.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
+            return;
+        }
+
+        MakeDirs(DownloadsRoot());
+        std::wstring suggested = SanitizeFileName(team) + L"-" + SanitizeFileName(pkgName) + L"-" +
+                                 SanitizeFileName(chk.latestVersion) + L".zip";
+        std::wstring destPath = BrowseSaveFile(hwnd,
+            L"Archive zip (*.zip)\0*.zip\0Tous les fichiers (*.*)\0*.*\0",
+            DownloadsRoot(), suggested, L"Enregistrer le zip du mod sous...");
+        if (destPath.empty()) return;   // annule par l'utilisateur
+
+        oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
+        std::wstring err;
+        bool ok = DownloadHexiumZip(chk.downloadUrl, destPath, err);
+        SetCursor(oldCursor);
+
+        if (!ok) {
+            std::wstring m = L"Telechargement impossible :\n" + err;
+            MessageBoxW(hwnd, m.c_str(), L"ValMods", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        for (size_t k = 0; k < g_mods.size(); ++k) {
+            if (g_mods[k].uid == uid) {
+                g_mods[k].tsVersion = chk.latestVersion;
+                g_mods[k].tsLatestDate = chk.latestDate;
+                g_mods[k].installedVersion = chk.latestVersion;
+                g_mods[k].last = NowStamp();
+                SaveMods();
+                RefillMods();
+                break;
+            }
+        }
+        std::wstring msg = L"Version " + chk.latestVersion + L" telechargee :\n" + destPath +
+            L"\n\nA extraire toi-meme dans BepInEx\\plugins - ValMods ne modifie\n"
+            L"jamais tes fichiers de jeu automatiquement.\n\n"
+            L"La version suivie comme installee a ete mise a jour a " + chk.latestVersion +
+            L" (a corriger dans Modifier si tu n'extrais pas ce zip).";
+        Info(hwnd, msg.c_str());
+        return;
+    }
 
     std::wstring ns, pkgName;
     if (!ParseThunderstoreUrl(url, ns, pkgName)) {
@@ -2290,8 +3853,10 @@ static void ActionDownloadLatest(HWND hwnd, int idx) {
     // installedVersion est aussi mis a jour : on suppose que ce zip va etre
     // extrait dans BepInEx/plugins (editable a la main dans l'editeur si ce
     // n'est pas le cas, ou si l'installation se fait autrement).
+    // identifiant stable (voir Mod::uid), PAS le nom - deux mods peuvent
+    // partager le meme nom (le meme mod ajoute a deux modpacks differents).
     for (size_t k = 0; k < g_mods.size(); ++k) {
-        if (g_mods[k].name == name) {
+        if (g_mods[k].uid == uid) {
             g_mods[k].tsVersion = version;
             g_mods[k].tsLatestDate = latestDate;
             g_mods[k].installedVersion = version;
@@ -2321,20 +3886,24 @@ static void ActionDownloadAll(HWND hwnd) {
 
     int eligible = 0;
     for (size_t i = 0; i < g_mods.size(); ++i) {
-        if (g_mods[i].nonThunderstore || !ModPassesFilters(g_mods[i])) continue;
-        std::wstring ns, nm;
-        if (ParseThunderstoreUrl(g_mods[i].url, ns, nm)) ++eligible;
+        if (!ModPassesFilters(g_mods[i])) continue;
+        std::wstring a, b;
+        if (g_mods[i].apiSource == API_THUNDERSTORE && ParseThunderstoreUrl(g_mods[i].url, a, b)) ++eligible;
+        else if (g_mods[i].apiSource == API_HEXIUM && ParseHexiumUrl(g_mods[i].url, a, b)) ++eligible;
     }
     if (eligible == 0) {
-        Info(hwnd, L"Aucun mod eligible : il faut un lien vers thunderstore.io,\n"
-                   L"ne pas etre marque \"Non Thunderstore\" (voir Modifier), et\n"
-                   L"correspondre aux filtres actuels (modpack / masquage des mods a jour).");
+        Info(hwnd, L"Aucun mod eligible : il faut un lien vers thunderstore.io ou\n"
+                   L"hexium.gg avec la source correspondante (voir Modifier - le\n"
+                   L"telechargement direct n'est pas disponible pour Nexus), et\n"
+                   L"correspondre aux filtres actuels (modpack / tag / masquage des\n"
+                   L"mods a jour).");
         return;
     }
 
     std::wstring packLabel = g_modpackFilter.empty() ? L"tous les mods" : (L"modpack \"" + g_modpackFilter + L"\"");
+    if (!g_tagFilter.empty()) packLabel += L", tag \"" + g_tagFilter + L"\"";
     std::wstring q = L"Telecharger les zips des " + std::to_wstring(eligible) +
-        L" mod(s) Thunderstore de la liste (" + packLabel +
+        L" mod(s) Thunderstore/Hexium de la liste (" + packLabel +
         (g_hideUpToDate ? L", mods a jour masques" : L"") + L") dans UN dossier de ton choix ?\n\n"
         L"Un zip par mod. Si sa derniere version n'est pas deja connue, elle\n"
         L"est verifiee d'abord (appel reseau supplementaire pour ce mod).\n\n"
@@ -2346,40 +3915,70 @@ static void ActionDownloadAll(HWND hwnd) {
         L"Choisir le dossier ou enregistrer tous les zips", DownloadsRoot());
     if (targetDir.empty()) return;   // annule
 
-    std::vector<std::wstring> names;
-    for (size_t i = 0; i < g_mods.size(); ++i) names.push_back(g_mods[i].name);
+    // identifiants stables (voir Mod::uid), PAS les noms : deux mods du meme
+    // nom (le meme mod ajoute a deux modpacks differents comme deux fiches
+    // separees) feraient sinon retomber les deux occurrences sur la premiere
+    // trouvee - un modpack traiterait deux fois la meme fiche pendant que
+    // l'autre modpack ne recevrait jamais son propre telechargement.
+    std::vector<int> uids;
+    for (size_t i = 0; i < g_mods.size(); ++i) uids.push_back(g_mods[i].uid);
 
     HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
     int downloaded = 0, errors = 0, skipped = 0;
-    for (size_t i = 0; i < names.size(); ++i) {
+    for (size_t i = 0; i < uids.size(); ++i) {
         int idx = -1;
         for (size_t k = 0; k < g_mods.size(); ++k)
-            if (g_mods[k].name == names[i]) { idx = (int)k; break; }
+            if (g_mods[k].uid == uids[i]) { idx = (int)k; break; }
         if (idx < 0) continue;
-        if (g_mods[idx].nonThunderstore || !ModPassesFilters(g_mods[idx])) { ++skipped; continue; }
+        bool isTs = (g_mods[idx].apiSource == API_THUNDERSTORE);
+        bool isHexium = (g_mods[idx].apiSource == API_HEXIUM);
+        if ((!isTs && !isHexium) || !ModPassesFilters(g_mods[idx])) { ++skipped; continue; }
 
         std::wstring ns, nm;
-        if (!ParseThunderstoreUrl(g_mods[idx].url, ns, nm)) { ++skipped; continue; }
+        if (isTs) {
+            if (!ParseThunderstoreUrl(g_mods[idx].url, ns, nm)) { ++skipped; continue; }
 
-        std::wstring version = g_mods[idx].tsVersion;
-        if (version.empty()) {
-            TsCheckResult chk = CheckThunderstoreVersion(g_mods[idx].url);
-            if (!chk.ok) { ++errors; continue; }
-            version = chk.latestVersion;
-            g_mods[idx].tsVersion = version;
+            std::wstring version = g_mods[idx].tsVersion;
+            if (version.empty()) {
+                TsCheckResult chk = CheckThunderstoreVersion(g_mods[idx].url);
+                if (!chk.ok) { ++errors; continue; }
+                version = chk.latestVersion;
+                g_mods[idx].tsVersion = version;
+                g_mods[idx].tsLatestDate = chk.latestDate;
+            }
+
+            std::wstring destPath = targetDir + L"\\" + SanitizeFileName(ns) + L"-" +
+                                    SanitizeFileName(nm) + L"-" + SanitizeFileName(version) + L".zip";
+            std::wstring err;
+            if (DownloadThunderstoreZip(ns, nm, version, destPath, err)) {
+                ++downloaded;
+                // meme logique que Telecharger (mod par mod) : on suppose que ce
+                // zip va etre extrait, donc on suit cette version comme installee.
+                g_mods[idx].installedVersion = version;
+            } else {
+                ++errors;
+            }
+        } else {   // isHexium
+            if (!ParseHexiumUrl(g_mods[idx].url, ns, nm)) { ++skipped; continue; }
+
+            // Pas de pattern d'URL a reconstruire : il faut le download_url
+            // renvoye par Hexium, donc on interroge systematiquement (mis en
+            // cache par FetchHexiumPackageList, voir plus haut) meme si
+            // tsVersion est deja connu.
+            HexiumCheckResult chk = CheckHexiumVersion(g_mods[idx].url);
+            if (!chk.ok || chk.downloadUrl.empty()) { ++errors; continue; }
+            g_mods[idx].tsVersion = chk.latestVersion;
             g_mods[idx].tsLatestDate = chk.latestDate;
-        }
 
-        std::wstring destPath = targetDir + L"\\" + SanitizeFileName(ns) + L"-" +
-                                SanitizeFileName(nm) + L"-" + SanitizeFileName(version) + L".zip";
-        std::wstring err;
-        if (DownloadThunderstoreZip(ns, nm, version, destPath, err)) {
-            ++downloaded;
-            // meme logique que Telecharger (mod par mod) : on suppose que ce
-            // zip va etre extrait, donc on suit cette version comme installee.
-            g_mods[idx].installedVersion = version;
-        } else {
-            ++errors;
+            std::wstring destPath = targetDir + L"\\" + SanitizeFileName(ns) + L"-" +
+                                    SanitizeFileName(nm) + L"-" + SanitizeFileName(chk.latestVersion) + L".zip";
+            std::wstring err;
+            if (DownloadHexiumZip(chk.downloadUrl, destPath, err)) {
+                ++downloaded;
+                g_mods[idx].installedVersion = chk.latestVersion;
+            } else {
+                ++errors;
+            }
         }
     }
     SetCursor(oldCursor);
@@ -2391,7 +3990,7 @@ static void ActionDownloadAll(HWND hwnd) {
         L"Dossier : " + targetDir + L"\n\n" +
         std::to_wstring(downloaded) + L" telecharge(s)\n" +
         std::to_wstring(errors)     + L" erreur(s)\n" +
-        std::to_wstring(skipped)    + L" ignore(s) (non Thunderstore / hors filtres)\n\n"
+        std::to_wstring(skipped)    + L" ignore(s) (source non Thunderstore/Hexium / hors filtres)\n\n"
         L"A extraire toi-meme dans BepInEx\\plugins - ValMods ne modifie\n"
         L"jamais tes fichiers de jeu automatiquement.\n\n"
         L"La version suivie comme installee a ete mise a jour pour chaque\n"
@@ -2400,29 +3999,18 @@ static void ActionDownloadAll(HWND hwnd) {
 }
 
 // ---------------------------------------------------------------- parametres
-static int CALLBACK BrowseCB(HWND hwnd, UINT msg, LPARAM lp, LPARAM data) {
-    if (msg == BFFM_INITIALIZED && data)
-        SendMessageW(hwnd, BFFM_SETSELECTION, TRUE, data);
-    return 0;
-}
 static void ChooseValheimDir(HWND hwnd) {
-    BROWSEINFOW bi; memset(&bi, 0, sizeof(bi));
-    wchar_t path[MAX_PATH] = L"";
-    bi.hwndOwner = hwnd;
-    bi.lpszTitle = L"Selectionne le dossier d'installation de Valheim (celui qui contient valheim.exe)";
-    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-    bi.lpfn = BrowseCB;
-    bi.lParam = g_valheimDir.empty() ? 0 : (LPARAM)g_valheimDir.c_str();
-    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
-    if (!pidl) return;
-    if (SHGetPathFromIDListW(pidl, path)) {
-        g_valheimDir = path;
-        SaveIni();
-        if (!FileExists(g_valheimDir + L"\\valheim.exe"))
-            Info(hwnd, L"Attention : valheim.exe n'a pas ete trouve dans ce dossier.\n"
-                       L"Le chemin est quand meme enregistre.");
-    }
-    CoTaskMemFree(pidl);
+    // passe par le meme helper que le reste de l'appli (BrowseFolder) -
+    // cette fonction dupliquait auparavant son corps ET son callback.
+    std::wstring picked = BrowseFolder(hwnd,
+        L"Selectionne le dossier d'installation de Valheim (celui qui contient valheim.exe)",
+        g_valheimDir);
+    if (picked.empty()) return;   // annule
+    g_valheimDir = picked;
+    SaveIni();
+    if (!FileExists(g_valheimDir + L"\\valheim.exe"))
+        Info(hwnd, L"Attention : valheim.exe n'a pas ete trouve dans ce dossier.\n"
+                   L"Le chemin est quand meme enregistre.");
 }
 
 // ---------------------------------------------------------------- interface
@@ -2444,38 +4032,65 @@ static void LayoutAll(HWND hwnd) {
     if (pw < 100) pw = 100;
     if (ph < 100) ph = 100;
 
-    // --- onglet mods : barre sur 2 rangees + panneau de cartes scrollable
-    // (rangee 1 : gestion/tri de la liste - rangee 2 : filtres + actions
-    // groupees, qui operent toutes deux sur le meme sous-ensemble filtre)
-    const int bh = 28, gap = 6, topH = 2 * (bh + gap) + 4;
-    HWND badd = GetDlgItem(hwnd, IDC_BADD);
+    // --- onglet mods : barre sur 5 rangees + panneau de cartes scrollable
+    // (rangee 0 : recherche texte libre - rangee 1 : cases "sur quoi
+    // chercher" - rangee 2 : tri de la liste - rangee 3 : filtres
+    // (modpack/tag/masquage a jour) - rangee 4 : actions groupees, qui
+    // operent sur le sous-ensemble filtre par les rangees 0/1/3)
+    const int bh = 28, gap = 6, topH = 5 * (bh + gap) + 4;
+    HWND searchBox = GetDlgItem(hwnd, IDC_SEARCHBOX);
+    int searchClearW = 90;
+    if (searchBox) MoveWindow(searchBox, px, py, pw - searchClearW - gap, bh, TRUE);
+    HWND searchClearBtn = GetDlgItem(hwnd, IDC_SEARCHCLEAR);
+    if (searchClearBtn) MoveWindow(searchClearBtn, px + pw - searchClearW, py, searchClearW, bh, TRUE);
+
+    // Cases "sur quoi chercher" - alignees a la meme hauteur, largeurs
+    // ajustees a la longueur de chaque libelle.
+    int ySearchOpts = py + (bh + gap);
     int x = px;
-    if (badd) MoveWindow(badd, x, py, 100, bh, TRUE);
+    static const int searchChkW[] = { 60, 90, 100, 70, 70, 100, 70 };
+    static const int searchChkIds[] = { IDC_SEARCH_NAME, IDC_SEARCH_CAT, IDC_SEARCH_DESC,
+        IDC_SEARCH_NOTE, IDC_SEARCH_TAGS, IDC_SEARCH_MODPACK, IDC_SEARCH_URL };
+    for (int si = 0; si < 7; ++si) {
+        HWND chk = GetDlgItem(hwnd, searchChkIds[si]);
+        if (chk) MoveWindow(chk, x, ySearchOpts, searchChkW[si], bh, TRUE);
+        x += searchChkW[si] + gap;
+    }
+
+    int y1 = py + 2 * (bh + gap);
+    HWND badd = GetDlgItem(hwnd, IDC_BADD);
+    x = px;
+    if (badd) MoveWindow(badd, x, y1, 100, bh, TRUE);
     x += 100 + gap;
     HWND combo = GetDlgItem(hwnd, IDC_SORTCOMBO);
     // la hauteur passee a un CBS_DROPDOWNLIST fixe celle de la liste DEROULEE,
     // pas celle du controle ferme (determinee par la police) - 200 est large.
-    if (combo) MoveWindow(combo, x, py, 220, 200, TRUE);
+    if (combo) MoveWindow(combo, x, y1, 220, 200, TRUE);
     x += 220 + gap;
     HWND dirBtn = GetDlgItem(hwnd, IDC_SORTDIR);
-    if (dirBtn) MoveWindow(dirBtn, x, py, 120, bh, TRUE);
+    if (dirBtn) MoveWindow(dirBtn, x, y1, 120, bh, TRUE);
 
-    int y2 = py + bh + gap;
+    int y2 = py + 3 * (bh + gap);
     x = px;
     HWND packCombo = GetDlgItem(hwnd, IDC_MODPACK);
     if (packCombo) MoveWindow(packCombo, x, y2, 180, 200, TRUE);
     x += 180 + gap;
+    HWND tagCombo = GetDlgItem(hwnd, IDC_TAGFILTER);
+    if (tagCombo) MoveWindow(tagCombo, x, y2, 160, 200, TRUE);
+    x += 160 + gap;
     HWND hideUpToDateChk = GetDlgItem(hwnd, IDC_HIDEUPTODATE);
     if (hideUpToDateChk) MoveWindow(hideUpToDateChk, x, y2, 150, bh, TRUE);
-    x += 150 + gap;
+
+    int y3 = py + 4 * (bh + gap);
+    x = px;
     HWND checkAllBtn = GetDlgItem(hwnd, IDC_CHECKALL);
-    if (checkAllBtn) MoveWindow(checkAllBtn, x, y2, 130, bh, TRUE);
+    if (checkAllBtn) MoveWindow(checkAllBtn, x, y3, 130, bh, TRUE);
     x += 130 + gap;
     HWND dlAllBtn = GetDlgItem(hwnd, IDC_DLALL);
-    if (dlAllBtn) MoveWindow(dlAllBtn, x, y2, 110, bh, TRUE);
+    if (dlAllBtn) MoveWindow(dlAllBtn, x, y3, 110, bh, TRUE);
     x += 110 + gap;
     HWND show10Chk = GetDlgItem(hwnd, IDC_SHOW10);
-    if (show10Chk) MoveWindow(show10Chk, x, y2, 90, bh, TRUE);
+    if (show10Chk) MoveWindow(show10Chk, x, y3, 90, bh, TRUE);
     if (g_hCardsHost) MoveWindow(g_hCardsHost, px, py + topH, pw, ph - topH, TRUE);
 
     // --- onglet sauvegardes
@@ -2498,6 +4113,17 @@ static HWND MkButton(HWND p, int id, const wchar_t* txt) {
         WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 10, 10,
         p, (HMENU)(INT_PTR)id, g_hInst, NULL);
     SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
+    return h;
+}
+// Case a cocher generique, position/taille reelles posees par LayoutAll
+// ensuite (comme MkButton) - "checked" fixe l'etat initial (voir les
+// reglages persistes g_searchIn*/g_hideUpToDate/g_showValheim10).
+static HWND MkCheck(HWND p, int id, const wchar_t* txt, bool checked) {
+    HWND h = CreateWindowExW(0, L"BUTTON", txt,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 0, 0, 10, 10,
+        p, (HMENU)(INT_PTR)id, g_hInst, NULL);
+    SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
+    SendMessageW(h, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
     return h;
 }
 static HWND MkList(HWND p, int id) {
@@ -2621,11 +4247,15 @@ static void BuildMenu(HWND hwnd) {
     AppendMenuW(d, MF_STRING, IDM_DOWNLOADS, L"Telechargements (zips Thunderstore)");
     HMENU p = CreatePopupMenu();
     AppendMenuW(p, MF_STRING, IDM_SETDIR, L"Definir le dossier de Valheim...");
+    AppendMenuW(p, MF_STRING, IDM_NEXUSKEY, L"Definir la cle API Nexus...");
+    HMENU o = CreatePopupMenu();
+    AppendMenuW(o, MF_STRING, IDM_FIXLIST, L"Completer les infos manquantes...");
     HMENU a = CreatePopupMenu();
     AppendMenuW(a, MF_STRING, IDM_ABOUT, L"A propos");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)f, L"Fichier");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)d, L"Dossiers");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)p, L"Parametres");
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)o, L"Outils");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)a, L"?");
     SetMenu(hwnd, bar);
 }
@@ -2657,8 +4287,44 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ti.pszText = (LPWSTR)L"Sauvegardes";
         TabCtrl_InsertItem(g_hTab, 1, &ti);
 
-        // page mods : barre (Ajouter + tri) + panneau de cartes scrollable
+        // page mods : barre (recherche + Ajouter + tri) + panneau de cartes
+        // scrollable
         g_nMods = 0;
+
+        // Recherche texte libre : filtre nom/categorie/description/note/
+        // tags/modpack/lien (voir ModMatchesSearch), mise a jour a chaque
+        // frappe (EN_CHANGE). Non persistee (voir g_searchQuery).
+        HWND searchBox = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            0, 0, 10, 10, hwnd, (HMENU)IDC_SEARCHBOX, g_hInst, NULL);
+        SendMessageW(searchBox, WM_SETFONT, (WPARAM)g_font, TRUE);
+        // Texte d'invite affiche tant que le champ est vide et sans focus -
+        // necessite Common Controls v6 (deja requis par le manifeste de
+        // l'appli pour les autres controles modernes).
+        SendMessageW(searchBox, EM_SETCUEBANNER, FALSE,
+            (LPARAM)L"Rechercher (nom, categorie, description, note, tag, modpack, lien)...");
+        g_pageMods[g_nMods++] = searchBox;
+
+        HWND searchClearBtn = MkButton(hwnd, IDC_SEARCHCLEAR, L"Effacer");
+        g_pageMods[g_nMods++] = searchClearBtn;
+
+        // Cases a cocher "sur quoi chercher" (voir g_searchIn*/ModMatchesSearch) -
+        // toutes cochees par defaut (comportement inchange si on n'y touche pas).
+        HWND chkSearchName = MkCheck(hwnd, IDC_SEARCH_NAME, L"Nom", g_searchInName);
+        g_pageMods[g_nMods++] = chkSearchName;
+        HWND chkSearchCat = MkCheck(hwnd, IDC_SEARCH_CAT, L"Categorie", g_searchInCat);
+        g_pageMods[g_nMods++] = chkSearchCat;
+        HWND chkSearchDesc = MkCheck(hwnd, IDC_SEARCH_DESC, L"Description", g_searchInDesc);
+        g_pageMods[g_nMods++] = chkSearchDesc;
+        HWND chkSearchNote = MkCheck(hwnd, IDC_SEARCH_NOTE, L"Note", g_searchInNote);
+        g_pageMods[g_nMods++] = chkSearchNote;
+        HWND chkSearchTags = MkCheck(hwnd, IDC_SEARCH_TAGS, L"Tags", g_searchInTags);
+        g_pageMods[g_nMods++] = chkSearchTags;
+        HWND chkSearchModpack = MkCheck(hwnd, IDC_SEARCH_MODPACK, L"Modpack", g_searchInModpack);
+        g_pageMods[g_nMods++] = chkSearchModpack;
+        HWND chkSearchUrl = MkCheck(hwnd, IDC_SEARCH_URL, L"Lien", g_searchInUrl);
+        g_pageMods[g_nMods++] = chkSearchUrl;
+
         g_pageMods[g_nMods++] = MkButton(hwnd, IDC_BADD, L"Ajouter");
 
         HWND combo = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
@@ -2666,12 +4332,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             0, 0, 10, 200, hwnd, (HMENU)IDC_SORTCOMBO, g_hInst, NULL);
         SendMessageW(combo, WM_SETFONT, (WPARAM)g_font, TRUE);
         const wchar_t* sortLabels[] = { L"Nom", L"Categorie", L"Derniere verification",
-                                        L"DLL", L"MAJ Thunderstore", L"Lien", L"Note" };
-        for (int si = 0; si < 7; ++si) SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)sortLabels[si]);
+                                        L"DLL", L"MAJ Thunderstore", L"Source", L"Lien", L"Note" };
+        for (int si = 0; si < 8; ++si) SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)sortLabels[si]);
         SendMessageW(combo, CB_SETCURSEL, 0, 0);
         g_pageMods[g_nMods++] = combo;
 
-        HWND dirBtn = MkButton(hwnd, IDC_SORTDIR, L"^ Croissant");
+        // "Tri" plutot que "Croissant"/"Decroissant" : le glyphe (^ / v) dit
+        // deja le sens, pas la peine de repeter la meme info en toutes lettres.
+        HWND dirBtn = MkButton(hwnd, IDC_SORTDIR, L"^ Tri");
         g_pageMods[g_nMods++] = dirBtn;
 
         HWND checkAllBtn = MkButton(hwnd, IDC_CHECKALL, L"Tout verifier");
@@ -2691,6 +4359,17 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(packCombo, CB_ADDSTRING, 0, (LPARAM)L"Tous les mods");
         SendMessageW(packCombo, CB_SETCURSEL, 0, 0);
         g_pageMods[g_nMods++] = packCombo;
+
+        // Filtre par tag : meme principe que le filtre modpack juste au-dessus
+        // (reconstruit dynamiquement dans RefillMods() - voir RefillTagCombo),
+        // mais un mod peut avoir plusieurs tags contrairement au modpack.
+        HWND tagCombo = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+            0, 0, 10, 200, hwnd, (HMENU)IDC_TAGFILTER, g_hInst, NULL);
+        SendMessageW(tagCombo, WM_SETFONT, (WPARAM)g_font, TRUE);
+        SendMessageW(tagCombo, CB_ADDSTRING, 0, (LPARAM)L"Tous les tags");
+        SendMessageW(tagCombo, CB_SETCURSEL, 0, 0);
+        g_pageMods[g_nMods++] = tagCombo;
 
         HWND hideUpToDateChk = CreateWindowExW(0, L"BUTTON", L"Masquer a jour",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
@@ -2729,7 +4408,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         // icone par defaut (mods sans logo choisi) : chargee une seule fois,
         // reutilisee par toutes les cartes qui n'ont pas d'iconPath valide.
-        g_defaultIcon = MakeDefaultIcon(40);
+        g_defaultIcon = MakeDefaultIcon(CARD_ICON_SIZE);
 
         // info-bulles : repond a "a quoi sert ce bouton ?" directement dans
         // l'interface. Celles des boutons de chaque carte sont ajoutees a
@@ -2743,10 +4422,27 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowPos(g_hTooltip, HWND_TOPMOST, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             AddTip(GetDlgItem(hwnd, IDC_BADD), L"Ajoute un nouveau mod a la liste");
+            AddTip(searchBox, L"Recherche en direct sur le nom, la categorie, la description,\n"
+                              L"la note, les tags, le modpack et le lien - se combine avec les\n"
+                              L"filtres Modpack/Tag et affecte aussi Tout verifier / Tout DL");
+            AddTip(searchClearBtn, L"Efface la recherche en cours");
+            AddTip(chkSearchName, L"Inclut le nom du mod dans la recherche");
+            AddTip(chkSearchCat, L"Inclut la categorie/auteur dans la recherche");
+            AddTip(chkSearchDesc, L"Inclut la description courte dans la recherche");
+            AddTip(chkSearchNote, L"Inclut la note dans la recherche");
+            AddTip(chkSearchTags, L"Inclut les tags dans la recherche");
+            AddTip(chkSearchModpack, L"Inclut le modpack dans la recherche");
+            AddTip(chkSearchUrl, L"Inclut le lien du mod dans la recherche - decoche-la si tu ne\n"
+                                 L"veux pas que des URL polluent tes resultats (si TOUTES les\n"
+                                 L"cases sont decochees, la recherche porte a nouveau sur tous\n"
+                                 L"les champs)");
             AddTip(combo,  L"Choisit le critere de tri de la liste");
             AddTip(dirBtn, L"Inverse l'ordre de tri (croissant / decroissant)");
             AddTip(packCombo, L"Filtre l'affichage sur un modpack donne (regroupement de mods\n"
                               L"assigne dans l'editeur) - affecte aussi Tout verifier / Tout DL");
+            AddTip(tagCombo, L"Filtre l'affichage sur un tag donne (tags libres assignes dans\n"
+                             L"l'editeur, separes par des virgules) - affecte aussi Tout verifier /\n"
+                             L"Tout DL. Se combine avec le filtre modpack.");
             AddTip(hideUpToDateChk, L"Masque les mods deja a jour (statut Thunderstore vert) de\n"
                                    L"l'affichage ET de Tout DL - pas de Tout verifier, qui doit\n"
                                    L"justement pouvoir decouvrir un changement de statut");
@@ -2818,7 +4514,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mm = (MINMAXINFO*)lp;
-        // 900 : marge confortable pour les 8 boutons de chaque carte de mod.
+        // 900 : marge confortable pour les 9 boutons de chaque carte de mod.
         mm->ptMinTrackSize.x = 900;
         mm->ptMinTrackSize.y = 480;
         return 0;
@@ -2848,8 +4544,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (cid == IDC_SORTCOMBO && HIWORD(wp) == CBN_SELCHANGE) {
             int sel = (int)SendMessageW(GetDlgItem(hwnd, IDC_SORTCOMBO), CB_GETCURSEL, 0, 0);
             static const int SORT_MAP[] = { COL_NAME, COL_CAT, COL_LASTCHECK, COL_DLL,
-                                            COL_TSVER, COL_URL, COL_NOTE };
-            if (sel >= 0 && sel < 7) { g_sortCol = SORT_MAP[sel]; RefillMods(); }
+                                            COL_TSVER, COL_SOURCE, COL_URL, COL_NOTE };
+            if (sel >= 0 && sel < 8) { g_sortCol = SORT_MAP[sel]; RefillMods(); }
             return 0;
         }
         if (cid == IDC_MODPACK && HIWORD(wp) == CBN_SELCHANGE) {
@@ -2866,9 +4562,35 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RefillMods();
             return 0;
         }
+        if (cid == IDC_TAGFILTER && HIWORD(wp) == CBN_SELCHANGE) {
+            HWND tc = GetDlgItem(hwnd, IDC_TAGFILTER);
+            int sel = (int)SendMessageW(tc, CB_GETCURSEL, 0, 0);
+            if (sel <= 0) {
+                g_tagFilter.clear();   // "Tous les tags" est toujours l'entree 0
+            } else {
+                wchar_t buf[256] = L"";
+                SendMessageW(tc, CB_GETLBTEXT, sel, (LPARAM)buf);
+                g_tagFilter = buf;
+            }
+            SaveMods();
+            RefillMods();
+            return 0;
+        }
+        // Recherche mise a jour a chaque frappe - PAS de SaveMods() ici,
+        // volontairement non persistee (voir g_searchQuery).
+        if (cid == IDC_SEARCHBOX && HIWORD(wp) == EN_CHANGE) {
+            g_searchQuery = GetTextOf(GetDlgItem(hwnd, IDC_SEARCHBOX));
+            RefillMods();
+            return 0;
+        }
 
         switch (cid) {
         case IDC_BADD: ActionAdd(hwnd); return 0;
+        case IDC_SEARCHCLEAR:
+            SetWindowTextW(GetDlgItem(hwnd, IDC_SEARCHBOX), L"");
+            g_searchQuery.clear();
+            RefillMods();
+            return 0;
         case IDC_CHECKALL: ActionCheckAll(hwnd); return 0;
         case IDC_DLALL: ActionDownloadAll(hwnd); return 0;
         case IDC_SHOW10:
@@ -2881,9 +4603,32 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SaveMods();
             RefillMods();
             return 0;
+        // Cases "sur quoi chercher" (voir g_searchIn*/ModMatchesSearch) - le
+        // meme geste (lire l'etat coche, persister, rafraichir) pour chacune.
+        case IDC_SEARCH_NAME:
+            g_searchInName = (SendMessageW(GetDlgItem(hwnd, IDC_SEARCH_NAME), BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SaveMods(); RefillMods(); return 0;
+        case IDC_SEARCH_CAT:
+            g_searchInCat = (SendMessageW(GetDlgItem(hwnd, IDC_SEARCH_CAT), BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SaveMods(); RefillMods(); return 0;
+        case IDC_SEARCH_DESC:
+            g_searchInDesc = (SendMessageW(GetDlgItem(hwnd, IDC_SEARCH_DESC), BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SaveMods(); RefillMods(); return 0;
+        case IDC_SEARCH_NOTE:
+            g_searchInNote = (SendMessageW(GetDlgItem(hwnd, IDC_SEARCH_NOTE), BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SaveMods(); RefillMods(); return 0;
+        case IDC_SEARCH_TAGS:
+            g_searchInTags = (SendMessageW(GetDlgItem(hwnd, IDC_SEARCH_TAGS), BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SaveMods(); RefillMods(); return 0;
+        case IDC_SEARCH_MODPACK:
+            g_searchInModpack = (SendMessageW(GetDlgItem(hwnd, IDC_SEARCH_MODPACK), BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SaveMods(); RefillMods(); return 0;
+        case IDC_SEARCH_URL:
+            g_searchInUrl = (SendMessageW(GetDlgItem(hwnd, IDC_SEARCH_URL), BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SaveMods(); RefillMods(); return 0;
         case IDC_SORTDIR:
             g_sortAsc = !g_sortAsc;
-            SetWindowTextW(GetDlgItem(hwnd, IDC_SORTDIR), g_sortAsc ? L"^ Croissant" : L"v Decroissant");
+            SetWindowTextW(GetDlgItem(hwnd, IDC_SORTDIR), g_sortAsc ? L"^ Tri" : L"v Tri");
             RefillMods();
             return 0;
 
@@ -2892,6 +4637,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // donc toujours dans la meme pile d'appels imbriquee que ci-dessus.
         case IDM_CTX_LOCATE_DLL:  PostMessageW(hwnd, WM_APP_ROWACTION, RA_MENU_LOCATE_DLL, g_ctxMenuModIndex);  return 0;
         case IDM_CTX_OPEN_DLLDIR: PostMessageW(hwnd, WM_APP_ROWACTION, RA_MENU_OPEN_DLLDIR, g_ctxMenuModIndex); return 0;
+        case IDM_CTX_LOCATE_CONFIG: PostMessageW(hwnd, WM_APP_ROWACTION, RA_MENU_LOCATE_CONFIG, g_ctxMenuModIndex); return 0;
+        case IDM_CTX_OPEN_CONFIG:   PostMessageW(hwnd, WM_APP_ROWACTION, RA_MENU_OPEN_CONFIG, g_ctxMenuModIndex);   return 0;
         case IDM_CTX_COPY:        PostMessageW(hwnd, WM_APP_ROWACTION, RA_MENU_COPY, g_ctxMenuModIndex);        return 0;
         case IDM_CTX_DELETE:      PostMessageW(hwnd, WM_APP_ROWACTION, RA_MENU_DELETE, g_ctxMenuModIndex);      return 0;
 
@@ -2910,6 +4657,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             OpenFolder(hwnd, DownloadsRoot(), L"telechargements"); return 0;
         case IDM_OPENDATA: OpenFolder(hwnd, ExeDir(),     L"donnees");          return 0;
         case IDM_SETDIR:   ChooseValheimDir(hwnd); UpdateTitle(); return 0;
+        case IDM_NEXUSKEY: ChooseNexusApiKey(hwnd); return 0;
+        case IDM_FIXLIST:  ActionFixList(hwnd); return 0;
         case IDM_EXIT:     DestroyWindow(hwnd); return 0;
         case IDM_ABOUT: {
             std::wstring about =
@@ -2923,13 +4672,27 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 L"\u2713  OK     : note la date de verification SANS ouvrir de lien\n"
                 L"           (utile si tu as deja verifie ailleurs : Discord du\n"
                 L"           mod, changelog deja ouvert dans un autre onglet...)\n"
-                L"\u26A1  TS     : verifie la derniere version sur Thunderstore\n"
-                L"\u2193  DL     : telecharge le zip (demande ou l'enregistrer)\n"
+                L"\u26A1  TS     : verifie la derniere version (Thunderstore ou Nexus)\n"
+                L"\u2193  DL     : telecharge le zip (Thunderstore uniquement)\n"
                 L"\u270E  Modif. : modifie le mod\n"
-                L"...       : copier le lien, localiser le DLL, ouvrir son\n"
-                L"           dossier, supprimer\n\n"
-                L"Le menu deroulant en haut choisit le critere de tri, le bouton a\n"
-                L"cote inverse l'ordre (croissant / decroissant).\n\n"
+                L"\u2699  Config  : ouvre le fichier de config avec le programme\n"
+                L"           associe par Windows (grise si aucun n'est defini)\n"
+                L"...       : copier le lien, localiser le DLL/la config,\n"
+                L"           ouvrir le dossier du mod ou la config, supprimer\n\n"
+                L"Le menu deroulant en haut choisit le critere de tri (dont \"Source\" :\n"
+                L"Thunderstore / Nexus / Aucune), le bouton a cote inverse l'ordre.\n\n"
+                L"Recherche (en haut de la liste) filtre en direct sur les champs\n"
+                L"coches juste en dessous (nom, categorie, description, note, tags,\n"
+                L"modpack, lien - decoche ceux qui ne t'interessent pas). Si TOUTES les\n"
+                L"cases sont decochees, la recherche porte a nouveau sur tous les\n"
+                L"champs. Le texte tape n'est pas enregistre d'un lancement a l'autre,\n"
+                L"contrairement au choix des champs et aux filtres ci-dessous.\n\n"
+                L"Filtre Modpack et filtre Tag (menus deroulants) se combinent : seuls\n"
+                L"les mods qui correspondent a TOUS les filtres actifs (recherche\n"
+                L"comprise) sont affiches, et affectent aussi Tout verifier / Tout DL.\n"
+                L"Les tags sont du texte libre separe par des virgules (champ \"Tags\"\n"
+                L"dans l'editeur) - un mod peut en avoir plusieurs, contrairement au\n"
+                L"modpack qui est unique.\n\n"
                 L"La ligne de details (categorie / verif / DLL / TS / 1.0) est coloree :\n"
                 L"rouge = probleme (DLL manquant ou mise a jour disponible),\n"
                 L"orange = verification ancienne (14+ jours), vert = tout va bien,\n"
@@ -2939,15 +4702,40 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 L"que la version n'a jamais ete verifiee, \"pas encore sortie\" tant que\n"
                 L"le 9 septembre n'est pas arrive (rien d'anormal), \"a verifier\" une\n"
                 L"fois la 1.0 sortie si ce mod n'a pas ete mis a jour depuis.\n\n"
-                L"Verif. TS interroge l'API publique de Thunderstore pour connaitre la\n"
-                L"derniere version publiee (uniquement pour les mods heberges sur\n"
-                L"thunderstore.io - Nexus/GitHub ne sont pas geres).\n\n"
-                L"Dans l'editeur, Auto-remplir depuis Thunderstore recupere le nom, la\n"
-                L"categorie, le lien historique, la description, la derniere version et\n"
-                L"l'icone du mod a partir du lien colle (meme limite : Thunderstore\n"
-                L"uniquement). Verif. TS complete aussi la description si elle est vide.\n\n"
+                L"Chaque mod a une source de verification (voir Modifier) : Thunderstore\n"
+                L"(API publique, aucune cle requise), Nexus Mods (necessite une cle API\n"
+                L"personnelle - menu Parametres > \"Definir la cle API Nexus...\"), ou\n"
+                L"Aucune (desactive TS/DL pour ce mod). Le telechargement direct (DL)\n"
+                L"ne fonctionne que pour Thunderstore - l'API de telechargement de\n"
+                L"Nexus est reservee aux comptes Premium.\n\n"
+                L"Dans l'editeur, Auto-remplir detecte automatiquement Thunderstore ou\n"
+                L"Nexus d'apres le lien colle, et recupere nom, description, derniere\n"
+                L"version et icone. Verif. TS complete aussi la description si elle est vide.\n\n"
                 L"Telecharger (DL) propose une boite Enregistrer sous - a extraire\n"
                 L"toi-meme dans BepInEx\\plugins, rien n'est installe automatiquement.\n\n"
+                L"Dans l'editeur, indique le DOSSIER dans lequel le mod est installe\n"
+                L"(pas le fichier .dll lui-meme) : le DLL a l'interieur est retrouve\n"
+                L"automatiquement (jusqu'a 2 sous-dossiers de profondeur), ce qui\n"
+                L"evite d'avoir a re-pointer vers un .dll qui change de nom d'une\n"
+                L"version a l'autre. Un fichier de config (optionnel, ex: le .cfg\n"
+                L"BepInEx du mod) peut aussi etre associe pour le localiser/l'ouvrir\n"
+                L"rapidement depuis le menu \"...\".\n\n"
+                L"Les icones telechargees ou choisies via Parcourir sont copiees dans\n"
+                L"icons\\ a cote de l'exe et enregistrees en chemin RELATIF : tu peux\n"
+                L"envoyer valmods.json + valmods.exe + icons\\ a un ami sans que les\n"
+                L"icones cassent (n'oublie pas de vider ta cle API Nexus avant, elle\n"
+                L"est personnelle).\n\n"
+                L"Menu Outils > Completer les infos manquantes : repasse l'auto-\n"
+                L"remplissage (Thunderstore/Nexus) sur tous les mods eligibles, mais\n"
+                L"SANS RIEN ECRASER - seuls les champs actuellement vides (categorie,\n"
+                L"lien historique, description, icone) sont completes ; une valeur\n"
+                L"deja saisie ou corrigee a la main reste intouchee. La version\n"
+                L"installee (installedVersion) n'est elle non plus jamais modifiee -\n"
+                L"seul Telecharger/Tout DL ou une saisie manuelle y touchent.\n\n"
+                L"Un valmods.json plus ancien ou d'une autre origine est repris tel\n"
+                L"quel a l'ouverture (structure et noms de champ tolerants) - une copie\n"
+                L"de l'original est gardee a cote (valmods.json.premigration) si le\n"
+                L"fichier semblait vraiment different du format actuel.\n\n"
                 L"Donnees : valmods.json, a cote de l'exe.";
             Info(hwnd, about.c_str());
             return 0;
@@ -2971,9 +4759,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             case RA_TS:    ActionCheckThunderstore(hwnd, idx);  break;
             case RA_DL:    ActionDownloadLatest(hwnd, idx);     break;
             case RA_EDIT:  ActionEdit(hwnd, idx);               break;
+            case RA_CONFIG: ActionOpenConfig(hwnd, idx);        break;
             case RA_MENU_COPY:        ActionCopy(hwnd, idx);        break;
             case RA_MENU_LOCATE_DLL:  ActionLocateDll(hwnd, idx);   break;
             case RA_MENU_OPEN_DLLDIR: ActionOpenDllDir(hwnd, idx);  break;
+            case RA_MENU_LOCATE_CONFIG: ActionLocateConfig(hwnd, idx); break;
+            case RA_MENU_OPEN_CONFIG:   ActionOpenConfig(hwnd, idx);   break;
             case RA_MENU_DELETE:      ActionDelete(hwnd, idx);      break;
         }
         return 0;
