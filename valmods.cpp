@@ -428,8 +428,8 @@ static bool IsAbsolutePath(const std::wstring& p) {
     return false;
 }
 // Transforme un chemin d'icone TEL QUE STOCKE dans valmods.json en chemin
-// utilisable pour charger le fichier : un chemin relatif (ex: "icons\\
-// Foo-Bar.png") est resolu par rapport au dossier de l'exe, un chemin
+// utilisable pour charger le fichier : un chemin relatif (ex: "icons"
+// suivi de "Foo-Bar.png") est resolu par rapport au dossier de l'exe, un chemin
 // absolu est utilise tel quel (icone choisie hors du dossier de l'appli -
 // ne pourra de toute facon pas voyager avec le .exe si on l'envoie a un
 // ami, voir StoreIconPath ci-dessous qui essaie d'eviter ce cas).
@@ -3622,8 +3622,8 @@ static bool ModMissingAutofillableField(const Mod& m) {
     // Hexium fournit une categorie (owner) mais pas de lien de changelog
     // separe (voir FetchHexiumAutofill) - meme logique que Nexus pour ce
     // champ, mais categorie tout de meme prise en compte comme Thunderstore.
-    if (m.apiSource == API_HEXIUM) return m.category.empty() || m.description.empty() || m.iconPath.empty();
-    return m.category.empty() || m.changelogUrl.empty() || m.description.empty() || m.iconPath.empty();
+    if (m.apiSource == API_HEXIUM) return m.cat.empty() || m.description.empty() || m.iconPath.empty();
+    return m.cat.empty() || m.changelogUrl.empty() || m.description.empty() || m.iconPath.empty();
 }
 // "Completer la liste" (menu Outils) : repasse l'auto-remplissage sur tous
 // les mods eligibles, mais de facon NON DESTRUCTIVE - contrairement au
@@ -3701,7 +3701,7 @@ static void ActionFixList(HWND hwnd) {
         if (!ok) { ++errors; continue; }
 
         bool changed = false;
-        if (m.category.empty() && !category.empty())         { m.category = category;         changed = true; }
+        if (m.cat.empty() && !category.empty())               { m.cat = category;               changed = true; }
         if (m.changelogUrl.empty() && !changelogUrl.empty()) { m.changelogUrl = changelogUrl;   changed = true; }
         if (m.description.empty() && !description.empty())   { m.description = description;    changed = true; }
         if (m.iconPath.empty() && !iconPath.empty())          { m.iconPath = iconPath;           changed = true; }
